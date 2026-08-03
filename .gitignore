@@ -1,1 +1,10 @@
 node_modules/
+
+# A project pin contains real client site ids — never commit one from inside
+# this package. (The disclosure check would catch it, but do not rely on that.)
+.wf.json
+
+# Local scratch: offloaded responses live under ~/.config/wf/responses, but
+# never let a stray copy in the working tree get committed.
+responses/
+*.log

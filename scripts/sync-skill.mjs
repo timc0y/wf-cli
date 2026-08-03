@@ -14,11 +14,7 @@ import { fileURLToPath } from "node:url";
 const REPO = resolve(fileURLToPath(import.meta.url), "../..");
 const TARGET = join(REPO, "skill");
 
-const HARNESSES = [
-  join(homedir(), ".claude", "skills"),
-  join(homedir(), ".codex", "skills"),
-  join(homedir(), ".config", "opencode", "skills")
-];
+const HARNESSES = [join(homedir(), ".claude", "skills"), join(homedir(), ".codex", "skills"), join(homedir(), ".config", "opencode", "skills")];
 
 const check = process.argv.includes("--check");
 let drift = 0;

@@ -47,13 +47,13 @@ became obvious — see the tiered-refusal design below.)
 - **Project pinning catches the worst failure mode.** A `.wf.json` in a
   client's repo pins the expected profile and site ids; a site-scoped call
   that resolves outside that pin is refused before it reaches the network.
-  With ~20 similar client workspaces on one machine, "ran the right command
-  against the wrong client" is the failure this exists to make structurally
-  hard, not just documented against.
+  Once a machine holds tokens for many similar client workspaces, "ran the
+  right command against the wrong client" is the failure this exists to make
+  structurally hard, not just documented against.
 - **Full audit trail.** Every network call is logged to
   `~/.config/wf/audit.jsonl` regardless of outcome, so "what did the agent
   actually do to this client's site" is always answerable after the fact.
-- **Free introspection.** Browsing the 100+ endpoint catalog (`wf ls`,
+- **Free introspection.** Browsing the 117-endpoint catalog (`wf ls`,
   `wf find`) and dry-running any call hits no network and needs no grant —
   an agent can fully plan a mutation, and a human can review the exact
   request, before any access is spent.

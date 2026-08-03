@@ -7,8 +7,15 @@
     "wf": "bin/wf.mjs"
   },
   "scripts": {
-    "test": "node --test test/*.test.mjs",
-    "sync-skill": "node scripts/sync-skill.mjs"
+    "lint": "biome check .",
+    "format": "biome check --write .",
+    "test": "npm run lint && node scripts/check-disclosure.mjs && node --test test/*.test.mjs",
+    "sync-skill": "node scripts/sync-skill.mjs",
+    "check-disclosure": "node scripts/check-disclosure.mjs",
+    "prepublishOnly": "node scripts/check-disclosure.mjs"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "1.9.4"
   },
   "engines": {
     "node": ">=20"
