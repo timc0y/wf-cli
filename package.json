@@ -3,6 +3,10 @@
   "version": "1.0.0",
   "description": "wf \u2014 Webflow Data API operator CLI with per-workspace profiles and human-issued, time-boxed access grants",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/timc0y/wf-cli.git"
+  },
   "bin": {
     "wf": "bin/wf.mjs"
   },
