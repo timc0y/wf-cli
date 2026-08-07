@@ -1,0 +1,32 @@
+{
+  "name": "wf-cli",
+  "version": "1.0.0",
+  "description": "wf \u2014 Webflow Data API operator CLI with per-workspace profiles and human-issued, time-boxed access grants",
+  "type": "module",
+  "bin": {
+    "wf": "bin/wf.mjs"
+  },
+  "scripts": {
+    "lint": "biome check .",
+    "format": "biome check --write .",
+    "test": "npm run lint && node scripts/check-disclosure.mjs && node --test test/*.test.mjs",
+    "sync-skill": "node scripts/sync-skill.mjs",
+    "check-disclosure": "node scripts/check-disclosure.mjs",
+    "prepublishOnly": "node scripts/check-disclosure.mjs"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "1.9.4"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT",
+  "files": ["bin/", "lib/", "skill/", "README.md", "LICENSE"],
+  "private": true,
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "ms": "^2.1.3",
+    "p-limit": "^7.3.1",
+    "prompts": "^2.4.2"
+  }
+}
