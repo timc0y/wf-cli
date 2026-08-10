@@ -80,7 +80,7 @@ first, believe it over this file if they ever disagree:
     wf status                      # who/where/what-access am I
     wf doctor                      # every offline check + the exact next action
     wf doctor codes                # every error code, what it means, what to do
-    wf ls | wf ls items            # browse the 117-endpoint catalog (offline)
+    wf ls | wf ls items            # browse the full endpoint catalog (offline)
     wf find publish                # search it
     wf schema items create-item    # the body shape it wants, with an example (offline)
     wf schema                      # every endpoint with a curated body contract
@@ -93,6 +93,8 @@ first, believe it over this file if they ever disagree:
     wf call items create-item --p collection_id=<id> --data '{"fieldData":{…}}' --check
     wf call items create-item --p collection_id=<id> --data '{"fieldData":{…}}' --dry
     wf call items create-item --p collection_id=<id> --data '{"fieldData":{…}}'
+    wf page-schema <pageId…> --site <id>            # read JSON-LD schema markup (beta)
+    wf page-schema set <pageId> --site <id> --file schema.json   # replace it
     wf audit report                # what happened lately
     wf assets upload <file...> --site <id> [--dir <path>] [--folder <name>] --dry
 
@@ -133,6 +135,36 @@ Read the `errorCode`; they mean different things and the right move differs.
 
 `wf doctor` interprets your whole state at once; `wf doctor codes` prints this
 list with recovery steps, straight from the tool.
+
+## Page schema markup (JSON-LD) — `wf page-schema`
+
+A page's JSON-LD structured data — the FAQ / breadcrumb / organization /
+product blocks that drive rich results — is readable and writable through four
+**beta** endpoints (`wf ls pages`, the `/beta/…` paths). `wf page-schema` is
+the typed front end; use it instead of hand-building the envelopes.
+
+    wf page-schema <pageId…> --site <siteId> [--locale <id>]        # read (up to 100 pages)
+    wf page-schema set <pageId…> --site <siteId> --file faq.json    # replace
+    wf page-schema set <pageId> --site <siteId> --clear             # remove it
+    wf page-schema set --site <siteId> --file bulk.json             # 25 entries, per-page/per-locale
+
+- **Always pass `--site`.** With it, the command routes through the bulk
+  endpoints, whose path carries the site id — the form a site-scoped grant can
+  verify. The single-page routes carry only a page id, so a site-scoped grant
+  refuses them (correctly: nothing local can prove which site that page is in).
+- `--file` / `--data` for a page is **the JSON-LD document itself**, not the
+  request body. With no page ids it's the endpoint's own
+  `{"pages":[{id, jsonLdSchema, localeId?}]}` shape (or just that array), which
+  is how you write a different document per page or per locale in one call.
+- **A write replaces the whole block** — there is no partial update. Read it
+  back (or read the PUT/PATCH response, which returns the stored value).
+- Reads are priced as reads even though the bulk one is a POST, so a read grant
+  is enough: `wf grant <profile> --sites <id>`.
+- Per-entry limits Webflow enforces: 60KB raw, 32 levels of nesting, 5,000
+  nodes. `--check` catches an oversized batch (>100 read / >25 write) locally.
+- `--locale <id>` targets a secondary locale. A locale with no markup of its
+  own answers with the primary locale's and `isInherited: true` — don't mistake
+  that for the locale having its own copy.
 
 ## Asset upload — `wf assets upload`
 

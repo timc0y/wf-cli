@@ -39,6 +39,12 @@
 //   wf call items list-items --p collection_id=<id> --q limit=5
 //   wf call items create-item --p collection_id=<id> --data '{"fieldData":{…}}'
 //   wf collections <siteId> | collection <id> | items <colId> | pages <siteId> | publish <siteId>
+//   wf page-schema <pageId…> --site <siteId> [--locale <id>]      JSON-LD schema markup (beta)
+//   wf page-schema set <pageId…> --site <siteId> --file schema.json | --data '<json>' | --clear
+//     (--data/--file is the JSON-LD DOCUMENT for a page; with no page ids it is
+//      the endpoint's own {"pages":[{id, jsonLdSchema}]} bulk body. --site
+//      routes through the site-scoped bulk endpoints, which are the ones a
+//      site-scoped grant can verify — always pass it.)
 //   wf get <path> | post | patch | put | delete      (raw)
 //   --dry on any invoke prints the exact request without sending.
 //   DELETE / publish / webhook creation also require --confirm <target-id>.
@@ -143,6 +149,9 @@ const {
   flagConcurrency,
   flagAll,
   liveClientAccess,
+  flagLocale,
+  flagPages,
+  flagClear,
   flagCheck,
   flagNoValidate,
   flagJson
@@ -574,7 +583,7 @@ const out = (res, reqInfo = {}) => {
 // still be caught cheaply.
 //
 // Contracts cover the endpoints where a wrong body is expensive or silent, not
-// all 117 — see lib/schemas.mjs. An endpoint with no contract is not checked,
+// all of them — see lib/schemas.mjs. An endpoint with no contract is not checked,
 // and `wf schema` says so rather than implying a pass. --no-validate sends
 // anyway, for when the contract is the thing that is wrong.
 const validateOrDie = ({ method, path, body }) => {
@@ -809,6 +818,93 @@ if (cmd === "assets") {
   } finally {
     if (tmpDir) rmSync(tmpDir, { recursive: true, force: true });
   }
+}
+
+// `wf page-schema` — a page's JSON-LD schema markup, first-class.
+//
+// The four beta schema-markup endpoints (see `wf ls pages`) are reachable
+// through `wf call`, but the raw form makes an agent hand-assemble the
+// {jsonLdSchema} / {pages:[…]} envelopes and, worse, invites the single-page
+// routes, which carry a page id and NO site id. A site-scoped grant cannot
+// verify those and refuses them — correctly, and confusingly. So this command
+// takes page ids and a JSON-LD document, and routes through the SITE-SCOPED
+// bulk endpoints whenever --site is given, which is the form that actually
+// works under a normal grant:
+//
+//   wf page-schema <pageId…>          [--site <id>] [--locale <id>]   read
+//   wf page-schema --pages <id,id,…>   --site <id>  [--locale <id>]   read (≤100)
+//   wf page-schema set <pageId…> --site <id> (--data <json>|--file <f>|--clear) [--locale <id>]
+//   wf page-schema set --site <id> --file <bulk.json>                 write (≤25 entries)
+//
+// --data/--file for a single page is the JSON-LD DOCUMENT itself, not the
+// request envelope. For the bulk file form it is the endpoint's own
+// {pages:[{id, jsonLdSchema, localeId?}]} body (or just that array).
+if (cmd === "page-schema") {
+  const setting = (positionals[1] || "").toLowerCase() === "set";
+  const ids = [...positionals.slice(setting ? 2 : 1), ...(flagPages || [])];
+  const bulkFile = setting && !ids.length;
+
+  if (!setting && !ids.length)
+    die("Usage: wf page-schema <pageId…> [--site <id>] [--locale <id>]", "wf page-schema set <pageId> --site <id> --file schema.json");
+  if (bulkFile && !file && data == null) {
+    die(
+      'wf page-schema set needs page ids, or a --file/--data body of {"pages":[{id, jsonLdSchema}]}.',
+      "wf page-schema set <pageId> --site <id> --file schema.json   |   --clear to remove it"
+    );
+  }
+  if (setting && !bulkFile && !flagClear && data == null && !file) {
+    die("wf page-schema set needs the JSON-LD document: --data '<json>', --file <path>, or --clear to remove it.");
+  }
+  if (flagClear && (data != null || file)) die("--clear and --data/--file are mutually exclusive: --clear sends jsonLdSchema: null.");
+  if (!flagSite && ids.length > 1)
+    die("Reading or writing more than one page goes through the bulk endpoints, which need --site <siteId>.", "wf sites  (free, no grant needed)");
+
+  // Single page, no --site: the only route available is the page-id-only one.
+  // It still works when the grant is not site-scoped, so allow it and say what
+  // the refusal will look like if it is.
+  if (!flagSite) {
+    console.error(
+      `! No --site given, so this uses ${setting ? "PUT" : "GET"} /beta/pages/${ids[0]}/schema-markup, whose path names no site. A site-scoped grant cannot verify that and will refuse it — pass --site <siteId> to use the bulk endpoint instead.`
+    );
+  }
+
+  const localeEntry = flagLocale ? { localeId: flagLocale } : {};
+
+  if (!setting) {
+    if (flagSite) {
+      await run({
+        method: "POST",
+        path: `beta/sites/${flagSite}/pages/schema-markup/query`,
+        body: { pages: ids.map((id) => ({ id, ...localeEntry })) }
+      });
+    }
+    await run({ method: "GET", path: `beta/pages/${ids[0]}/schema-markup`, query: flagLocale ? { localeId: flagLocale } : undefined });
+  }
+
+  // A write. `--clear` is jsonLdSchema: null; otherwise the parsed JSON is the
+  // JSON-LD document (an object, or a string of raw/script-wrapped JSON).
+  const jsonLd = flagClear ? null : bodyFromFlags();
+
+  if (bulkFile) {
+    const entries = Array.isArray(jsonLd) ? jsonLd : jsonLd?.pages;
+    if (!Array.isArray(entries)) die('The bulk body must be {"pages":[{id, jsonLdSchema, localeId?}]} — or just that array.');
+    if (!flagSite) die("wf page-schema set --file <bulk.json> needs --site <siteId>.");
+    await run({ method: "PATCH", path: `beta/sites/${flagSite}/pages/schema-markup`, body: { pages: entries } });
+  }
+
+  if (flagSite) {
+    await run({
+      method: "PATCH",
+      path: `beta/sites/${flagSite}/pages/schema-markup`,
+      body: { pages: ids.map((id) => ({ id, jsonLdSchema: jsonLd, ...localeEntry })) }
+    });
+  }
+  await run({
+    method: "PUT",
+    path: `beta/pages/${ids[0]}/schema-markup`,
+    query: flagLocale ? { localeId: flagLocale } : undefined,
+    body: { jsonLdSchema: jsonLd }
+  });
 }
 
 // `wf sites` prints a compact table (name | shortName | id) instead of the
