@@ -268,8 +268,10 @@ describe("guardrails v2 — destructive confirmation", () => {
     assert.equal(grants.confirmationTargetFor("DELETE", "collections/col_123"), "col_123");
     assert.equal(grants.confirmationTargetFor("POST", "sites/site_9/publish"), "site_9");
     assert.equal(grants.confirmationTargetFor("POST", "sites/site_9/webhooks"), "site_9");
-    // Bulk item targets live in the request body. The container words are not
-    // target ids and must never be accepted as a reusable confirmation.
+    // Bulk item targets live in the request body, so a path alone cannot name
+    // them: the container words (`items`, `live`, `publish`) are not target ids
+    // and must never be accepted as a reusable confirmation. Bulk publish binds
+    // to the id set when a body is supplied — see test/typed-commands.test.mjs.
     assert.equal(grants.confirmationTargetFor("DELETE", "collections/col_123/items"), null);
     assert.equal(grants.confirmationTargetFor("POST", "collections/col_123/items/publish"), null);
     assert.equal(grants.confirmationTargetFor("DELETE", "collections/col_123/items/live"), null);

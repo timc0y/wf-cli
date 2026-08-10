@@ -163,33 +163,60 @@ describe("no access gate loosened: publish/live paths still need exactly what th
     assert.equal(res.data.wouldSend.tierNeeded, "danger");
   });
 
-  it("wf item publish is refused even WITH a danger grant and a --confirm — the bulk body-carried target still cannot be confirmed (pre-existing, not loosened by this change)", async () => {
-    grants.issueGrant({ profile: "acme", tier: "danger", ttlMs: 60_000, siteIds: [SITE_A] });
+  // Bulk publish's confirmation binds to the SET of item ids in the body
+  // (confirmationTargetFor in lib/grants.mjs). These pin what that buys and,
+  // more importantly, what it must NOT accept.
+  const ITEM_B = "jjjjjjjjjjjjjjjjjjjjjjjj";
+  const publish = (itemIds, confirm) =>
+    webflowRequest({ profile: "acme", method: "POST", path: `collections/${COLLECTION}/items/publish`, body: { itemIds }, confirm });
+
+  it("names the whole sorted id set as the confirmation, in --dry", async () => {
     const res = await webflowRequest({
       profile: "acme",
       method: "POST",
       path: `collections/${COLLECTION}/items/publish`,
-      body: { itemIds: [ITEM] },
-      confirm: ITEM
+      body: { itemIds: [ITEM_B, ITEM] },
+      dryRun: true
     });
-    assert.equal(res.ok, false);
-    assert.equal(res.errorCode, CODES.WF_CONFIRM_REQUIRED);
+    assert.equal(res.data.wouldSend.confirmRequired, `--confirm ${ITEM},${ITEM_B}`);
+  });
+
+  it("refuses a confirmation that names only part of the set, or a set that has since changed", async () => {
+    grants.issueGrant({ profile: "acme", tier: "danger", ttlMs: 60_000, siteIds: [SITE_A] });
+    for (const confirm of [ITEM, ITEM_B, `${ITEM},${ITEM_B},${SITE_A}`, "items", undefined]) {
+      const res = await publish([ITEM, ITEM_B], confirm);
+      assert.equal(res.ok, false, `confirm=${confirm} must not satisfy a two-item publish`);
+      assert.equal(res.errorCode, CODES.WF_CONFIRM_REQUIRED);
+    }
+    grants.revokeAll();
+  });
+
+  it("accepts the full set regardless of the order it was passed in", () => {
+    const target = grants.confirmationTargetFor("POST", `collections/${COLLECTION}/items/publish`, { itemIds: [ITEM_B, ITEM] });
+    assert.equal(target, `${ITEM},${ITEM_B}`);
+    assert.equal(grants.confirmationTargetFor("POST", `collections/${COLLECTION}/items/publish`, { itemIds: [ITEM, ITEM_B] }), target);
+    // Duplicates cannot pad a set into a different confirmation string.
+    assert.equal(grants.confirmationTargetFor("POST", `collections/${COLLECTION}/items/publish`, { itemIds: [ITEM, ITEM, ITEM_B] }), target);
+  });
+
+  it("still cannot be confirmed when the body carries no usable id list", () => {
+    for (const body of [null, {}, { itemIds: [] }, { itemIds: [""] }, { itemIds: [{ id: ITEM }] }]) {
+      assert.equal(grants.confirmationTargetFor("POST", `collections/${COLLECTION}/items/publish`, body), null, JSON.stringify(body));
+    }
+  });
+
+  it("does not extend set-confirmation to bulk DELETE or bulk live writes — those stay refused closed", () => {
+    const body = { itemIds: [ITEM] };
+    assert.equal(grants.confirmationTargetFor("DELETE", `collections/${COLLECTION}/items`, body), null);
+    assert.equal(grants.confirmationTargetFor("DELETE", `collections/${COLLECTION}/items/live`, body), null);
   });
 
   it("a write-only grant still cannot reach wf item publish — danger tier is enforced, not bypassed", async () => {
     grants.issueGrant({ profile: "acme", tier: "write", ttlMs: 60_000, siteIds: [SITE_A] });
-    const res = await webflowRequest({
-      profile: "acme",
-      method: "POST",
-      path: `collections/${COLLECTION}/items/publish`,
-      body: { itemIds: [ITEM] },
-      confirm: ITEM
-    });
+    const res = await publish([ITEM], ITEM);
     assert.equal(res.ok, false);
-    // Confirm gate fires before the grant tier check in webflowRequest, so the
-    // code here is still WF_CONFIRM_REQUIRED — the point of this test is that
-    // there is no path through which a write grant alone reaches this call.
-    assert.equal(res.errorCode, CODES.WF_CONFIRM_REQUIRED);
+    assert.equal(res.errorCode, CODES.WF_GRANT_TIER);
+    grants.revokeAll();
   });
 
   it("--live's underlying PATCH (.../items/{id}/live) still needs a write grant, same tier as any other item edit — this command did not invent a bypass", async () => {

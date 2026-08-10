@@ -222,11 +222,12 @@ locally with the exact flag to add. The same rule is now also enforced on the
 `wf call fields create` gets the same protection even without this command.
 
 **`wf item publish`** builds `{itemIds: […]}` for the bulk publish endpoint.
-It does not get special treatment from the confirm gate: that endpoint carries
-its targets in the request body, not the URL, so there is no id for
-`--confirm` to bind to the way it binds a single DELETE — the call is refused
-closed today, the same as `wf call items publish-item`. This command does not
-change that; it only saves you from hand-building the body.
+Publish is **danger tier** (`--write --danger`) and its `--confirm` names the
+whole set of item ids, sorted and comma-joined — `--dry` prints the exact
+string. Naming one id out of several does not satisfy it, and a set that
+changed after the preview invalidates it. That set-binding applies to bulk
+publish only: bulk DELETE and bulk live writes carry their targets in the body
+with no equivalent contract, so they stay refused closed.
 
 ## Asset upload — `wf assets upload`
 

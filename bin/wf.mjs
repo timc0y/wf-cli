@@ -42,7 +42,7 @@
 //   wf fields <collectionId>                                      field table: slug | type | required | displayName
 //   wf fields add <collId> --type <Type> --name <Name> [--to <id>] [--options a,b,c]
 //   wf items set <collId> <itemId> --set slug=value […] [--draft true|false] [--archived true|false] [--live]
-//   wf item publish <collId> <itemId…>                            bulk publish (danger tier; see bin/wf.mjs comment)
+//   wf item publish <collId> <itemId…>                            bulk publish (danger; --confirm the id set)
 //   wf page-schema <pageId…> --site <siteId> [--locale <id>]      JSON-LD schema markup (beta)
 //   wf page-schema set <pageId…> --site <siteId> --file schema.json | --data '<json>' | --clear
 //     (--data/--file is the JSON-LD DOCUMENT for a page; with no page ids it is
@@ -275,9 +275,10 @@ const AGENT_CONTRACT = `wf — agent contract (the CLI enforces all of this; you
    against a live read of the collection before writing (skipped, and says so,
    under --check/--dry/--no-validate). \`--live\` writes the published item
    directly and requires restating the item id via --confirm <id>. \`wf item
-   publish\` builds the bulk publish body but is refused today by the confirm
-   gate — bulk targets live in the request body, not the URL, so there is no
-   id to restate; this is the same refusal \`wf call items publish-item\` gives.`;
+   publish <collId> <itemId…>\` builds the bulk publish body; it is danger tier
+   and its --confirm is the whole SET of item ids, sorted and comma-joined —
+   run --dry first, which prints the exact string. A changed id set invalidates
+   a confirmation, which is the point.`;
 
 // ── free commands ─────────────────────────────────────────────────────────────
 if (!cmd || ["help", "-h", "--help"].includes(cmd)) {
@@ -1238,23 +1239,20 @@ if (cmd === "items" && positionals[1] === "set") {
 
 // `wf item publish <collectionId> <itemId…>` — typed form of the bulk publish
 // endpoint (POST /collections/{id}/items/publish; 18 hand-assembled calls in
-// the audited window). This command only builds the {itemIds} body — it does
-// NOT get special treatment from the confirm gate. confirmationTargetFor
-// (lib/grants.mjs) already refuses this exact shape closed: the endpoint
-// carries its targets in the request body, not the URL, and there is no
-// locally-proven per-target confirmation for a bulk body, so --confirm cannot
-// bind to one of several item ids the way it binds to a single DELETE's id.
-// That refusal is pre-existing and intentional (identical to
-// `wf call items publish-item` today) — this command does not loosen it, and
-// running it will report the same "cannot be confirmed safely" refusal until
-// a human decides how a bulk target should be confirmed.
+// the audited window). This command only builds the {itemIds} body; the confirm
+// gate is unchanged and applies to it exactly as it does to `wf call items
+// publish-item`. That gate used to refuse this shape closed, because the target
+// lives in the body rather than the path — it now binds to the SET of item ids
+// instead (sorted and comma-joined; see confirmationTargetFor in
+// lib/grants.mjs, and --dry prints the exact --confirm string). Publish is
+// still danger tier: it needs --write --danger.
 if (cmd === "item" && positionals[1] === "publish") {
   const collectionId = positionals[2];
   const itemIds = positionals.slice(3);
   if (!collectionId || !itemIds.length)
     die(
       "Usage: wf item publish <collectionId> <itemId…>",
-      "Publishes staged items to live. Danger tier — see the comment above this command in bin/wf.mjs for why it is refused today."
+      "Publishes staged items to live. Danger tier (--write --danger) and --confirm the whole id set — run it with --dry first; the preview prints the exact --confirm string."
     );
   await run({ method: "POST", path: `collections/${collectionId}/items/publish`, body: { itemIds } });
 }
