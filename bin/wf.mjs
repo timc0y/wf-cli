@@ -39,6 +39,10 @@
 //   wf call items list-items --p collection_id=<id> --q limit=5
 //   wf call items create-item --p collection_id=<id> --data '{"fieldData":{…}}'
 //   wf collections <siteId> | collection <id> | items <colId> | pages <siteId> | publish <siteId>
+//   wf fields <collectionId>                                      field table: slug | type | required | displayName
+//   wf fields add <collId> --type <Type> --name <Name> [--to <id>] [--options a,b,c]
+//   wf items set <collId> <itemId> --set slug=value […] [--draft true|false] [--archived true|false] [--live]
+//   wf item publish <collId> <itemId…>                            bulk publish (danger tier; see bin/wf.mjs comment)
 //   wf page-schema <pageId…> --site <siteId> [--locale <id>]      JSON-LD schema markup (beta)
 //   wf page-schema set <pageId…> --site <siteId> --file schema.json | --data '<json>' | --clear
 //     (--data/--file is the JSON-LD DOCUMENT for a page; with no page ids it is
@@ -154,7 +158,18 @@ const {
   flagClear,
   flagCheck,
   flagNoValidate,
-  flagJson
+  flagJson,
+  setFields,
+  flagDraft,
+  flagArchived,
+  flagLive,
+  flagType,
+  flagName,
+  flagTo,
+  flagOptions,
+  flagRequired,
+  flagHelpText,
+  flagSlug
 } = parseCliArgs(process.argv.slice(2));
 
 if (liveClientAccess) {
@@ -252,7 +267,17 @@ const AGENT_CONTRACT = `wf — agent contract (the CLI enforces all of this; you
    collection was created after the grant was issued.
 10. Browsing the endpoint catalog (\`wf ls\`, \`wf find\`, \`wf schema\`) is free
    and never touches the network. Use it to find the right endpoint and its
-   body shape before asking for a grant.`;
+   body shape before asking for a grant.
+11. CMS ITEM WRITES: use \`wf items set <collId> <itemId> --set slug=value\`
+   instead of hand-building a fieldData body — it wraps every --set inside
+   fieldData for you, so a slug typed at the top level (accepted, ignored, 200,
+   nothing changed) cannot happen from this command. It also checks your slugs
+   against a live read of the collection before writing (skipped, and says so,
+   under --check/--dry/--no-validate). \`--live\` writes the published item
+   directly and requires restating the item id via --confirm <id>. \`wf item
+   publish\` builds the bulk publish body but is refused today by the confirm
+   gate — bulk targets live in the request body, not the URL, so there is no
+   id to restate; this is the same refusal \`wf call items publish-item\` gives.`;
 
 // ── free commands ─────────────────────────────────────────────────────────────
 if (!cmd || ["help", "-h", "--help"].includes(cmd)) {
@@ -555,8 +580,19 @@ const profile = resolved.profile;
 // Successful responses print in full UNLESS they are large, in which case the
 // complete response goes to a file and a small envelope naming it is printed
 // instead (lib/offload.mjs). Nothing is ever truncated — see that file for why.
-const out = (res, reqInfo = {}) => {
+// `render`, when given, replaces the raw-JSON success path with a table (e.g.
+// `wf fields`) the way `wf sites` already prints a table instead of a JSON
+// blob. It never runs for a --dry preview (that's the request, not the
+// resource) and it never runs over an offloaded response (a table over a file
+// envelope would hide the thing offloading exists to surface — the path).
+const out = (res, reqInfo = {}, render = null) => {
   if (res.ok) {
+    if (render && !res.dryRun) {
+      const result = offloadIfLarge(res.data, reqInfo);
+      if (result.offloaded) console.log(JSON.stringify(result.envelope, null, 2));
+      else console.log(render(res.data));
+      process.exit(0);
+    }
     const result = offloadIfLarge(res.data, reqInfo);
     if (result.offloaded) {
       console.log(JSON.stringify(result.envelope, null, 2));
@@ -611,7 +647,7 @@ const validateOrDie = ({ method, path, body }) => {
   return { endpoint, checked };
 };
 
-const run = async ({ method, path, query: q2, body }) => {
+const run = async ({ method, path, query: q2, body }, render = null) => {
   // webflowRequest (below) now enforces this same pin itself — see
   // lib/client.mjs — so this is no longer the only thing standing between a
   // wrong-client path and the network. It stays here anyway: checkSitePin is
@@ -643,7 +679,7 @@ const run = async ({ method, path, query: q2, body }) => {
     process.exit(0);
   }
 
-  out(await webflowRequest({ profile, method, path, query: q2, body, dryRun, confirm: flagConfirm, project }), { path, method });
+  out(await webflowRequest({ profile, method, path, query: q2, body, dryRun, confirm: flagConfirm, project }), { path, method }, render);
 };
 
 const bodyFromFlags = () => {
@@ -656,6 +692,42 @@ const bodyFromFlags = () => {
   }
 };
 const q = () => (Object.keys(query).length ? query : undefined);
+
+// `--set slug=value` arrives as a string, always. Coercion order: "true"/
+// "false" -> boolean; a bare integer or decimal -> number; something that
+// looks like a JSON object/array -> parsed JSON, refused loudly if it does not
+// actually parse (never silently kept as the literal text); anything else
+// stays a string. The one edge this cannot cover: a field whose real value
+// SHOULD be the literal text "true", "false", or a number-looking string —
+// `wf call items update-item --data …` is the escape hatch for that case.
+const coerceSetValue = (raw) => {
+  if (raw === "true") return true;
+  if (raw === "false") return false;
+  if (/^-?\d+$/.test(raw)) return Number.parseInt(raw, 10);
+  if (/^-?\d*\.\d+$/.test(raw)) return Number.parseFloat(raw);
+  if ((raw.startsWith("{") && raw.endsWith("}")) || (raw.startsWith("[") && raw.endsWith("]"))) {
+    try {
+      return JSON.parse(raw);
+    } catch (error) {
+      die(
+        `--set value "${raw}" looks like JSON but does not parse: ${error.message}`,
+        "Quote it as a plain string if that was intentional, e.g. --set notes='{not json}'."
+      );
+    }
+  }
+  return raw;
+};
+
+// `--draft`/`--archived` take an explicit "true"/"false" rather than being
+// bare boolean flags, because both map onto a body key that can legitimately
+// go either way (un-drafting, un-archiving) — a presence-only flag can only
+// ever mean "true".
+const parseBoolFlag = (raw, flagName) => {
+  if (raw == null) return undefined;
+  if (raw === "true") return true;
+  if (raw === "false") return false;
+  die(`--${flagName} must be "true" or "false", not "${raw}".`);
+};
 
 if (cmd === "call") {
   const [, group, name] = positionals;
@@ -1002,6 +1074,189 @@ if (cmd === "collections" && positionals[1] === "refresh") {
     }
   }
   process.exit(failed ? 1 : 0);
+}
+
+// `wf fields <collectionId>` — a collection's field list as a table (slug |
+// type | required | displayName), the way `wf sites` prints a table instead
+// of the raw JSON. There is no dedicated "list fields" endpoint — Webflow
+// returns a collection's fields inline on GET /collections/{collection_id}
+// (the existing `collections/get` entry in lib/endpoints.mjs), so this reuses
+// it rather than inventing a new one. Raw JSON stays reachable via
+// `wf call collections get --p collection_id=<id>` or `wf get collections/<id>`.
+const renderFieldsTable = (data) => {
+  const fields = Array.isArray(data?.fields) ? data.fields : [];
+  if (!fields.length) return "(collection has no fields)";
+  const rows = [
+    ["slug", "type", "required", "displayName"],
+    ...fields.map((f) => [f.slug ?? "", f.type ?? "", f.isRequired ? "yes" : "no", f.displayName ?? ""])
+  ];
+  const widths = rows[0].map((_, col) => Math.max(...rows.map((row) => String(row[col]).length)));
+  return rows.map((row) => row.map((cell, col) => String(cell).padEnd(widths[col])).join("  ")).join("\n");
+};
+
+if (cmd === "fields" && positionals[1] !== "add") {
+  const collectionId = positionals[1];
+  if (!collectionId) die("Usage: wf fields <collectionId>", "wf collections <siteId> to find a collection id first. `wf fields add …` creates a field.");
+  await run({ method: "GET", path: `collections/${collectionId}` }, renderFieldsTable);
+}
+
+// `wf fields add <collectionId> --type <Type> --name <DisplayName> […]` —
+// typed field creation. One historical failure this closes: "Reference fields
+// must have a collectionId", previously only prose in lib/schemas.mjs's
+// fields/create `note`. It is now a `requiredWhen` rule on that contract too
+// (so `wf call fields create` gets the same protection), but this command
+// refuses BEFORE assembling the body at all, with the exact fix in the
+// message, since --to/--options are what the fix actually looks like from here.
+if (cmd === "fields" && positionals[1] === "add") {
+  const collectionId = positionals[2];
+  if (!collectionId)
+    die(
+      "Usage: wf fields add <collectionId> --type <Type> --name <DisplayName> [--to <collectionId>] [--options a,b,c] [--required] [--slug <slug>] [--help-text <text>]",
+      "wf schema fields create — the full body shape and every accepted --type."
+    );
+  if (!flagType || !flagName) die("wf fields add needs --type <Type> and --name <DisplayName>.", "wf schema fields create");
+
+  const metadata = {};
+  if (flagType === "Reference" || flagType === "MultiReference") {
+    if (!flagTo)
+      die(
+        `--type ${flagType} needs --to <collectionId> — Reference/MultiReference fields must name the collection they point to.`,
+        `wf fields add ${collectionId} --type ${flagType} --name "${flagName}" --to <targetCollectionId>`
+      );
+    metadata.collectionId = flagTo;
+  }
+  if (flagType === "Option") {
+    if (!flagOptions?.length)
+      die(
+        "--type Option needs --options a,b,c (comma-separated choice names).",
+        `wf fields add ${collectionId} --type Option --name "${flagName}" --options a,b,c`
+      );
+    // Webflow's field-create metadata.options takes an object per choice
+    // ({ name }, Webflow assigns the id), per the Data API v2 docs — this repo
+    // has never made this call, so it is unverified against a live response.
+    // --dry (or --check) before sending it for real.
+    metadata.options = flagOptions.map((name) => ({ name }));
+  }
+
+  const body = {
+    type: flagType,
+    displayName: flagName,
+    ...(flagRequired ? { isRequired: true } : {}),
+    ...(flagHelpText ? { helpText: flagHelpText } : {}),
+    ...(flagSlug ? { slug: flagSlug } : {}),
+    ...(Object.keys(metadata).length ? { metadata } : {})
+  };
+  await run({ method: "POST", path: `collections/${collectionId}/fields`, body });
+}
+
+// `wf items set <collectionId> <itemId> --set slug=value […]` — typed CMS
+// item PATCH. Historical failures this is built to prevent: "Validation
+// Error"/"Bad Request: Missing fields" from a hand-built body, and — the
+// quiet one — "Body should have required property 'fieldData'" from a slug
+// written at the top level instead of inside it. That last mistake is
+// structurally impossible here: --set values only ever land inside fieldData,
+// there is no top level to put them at from this command.
+if (cmd === "items" && positionals[1] === "set") {
+  const collectionId = positionals[2];
+  const itemId = positionals[3];
+  if (!collectionId || !itemId) {
+    die(
+      "Usage: wf items set <collectionId> <itemId> --set slug=value [--set slug2=value2 …] [--draft true|false] [--archived true|false] [--live]",
+      "wf fields <collectionId> to see the real slugs first."
+    );
+  }
+  if (!Object.keys(setFields).length && flagDraft == null && flagArchived == null) {
+    die("Nothing to write — pass at least one --set slug=value, or --draft/--archived.");
+  }
+
+  const fieldData = {};
+  for (const [slug, raw] of Object.entries(setFields)) fieldData[slug] = coerceSetValue(raw);
+  const isDraft = parseBoolFlag(flagDraft, "draft");
+  const isArchived = parseBoolFlag(flagArchived, "archived");
+  if (flagLive && isDraft !== undefined) die("--draft has no effect on a live item — drop --live or drop --draft.");
+
+  // Unknown-slug refusal needs the collection's REAL fields. This fetches them
+  // live — one extra read call, immediately before the write — rather than
+  // trusting any local cache, because a stale cache is exactly what would let
+  // this mistake through. That fetch only happens when a live call is actually
+  // about to be made: --check and --dry stay network-free by design (see
+  // validateOrDie/webflowRequest above), and --no-validate is the explicit
+  // opt-out for when local checking is the thing that's wrong. Each skip says
+  // so below rather than silently behaving as if the slugs had been checked.
+  if (flagCheck) {
+    console.error("! --check cannot verify field slugs against Webflow (that needs a network call) — it only checks the body shape.");
+  } else if (dryRun) {
+    console.error("! --dry does not verify field slugs against Webflow — the preview is not proof the slugs are real.");
+  } else if (flagNoValidate) {
+    console.error("! --no-validate: sending without checking field slugs against the collection first.");
+  } else if (getGrant(profile)?.once) {
+    // A single-use grant is consumed by the FIRST call it authorizes, including
+    // a verification read — so making that read here would spend the grant and
+    // leave the actual write with nothing, which is the exact trap the skill
+    // warns about. Skip it and say so; the slugs stay unchecked.
+    console.error(
+      `! single-use grant: skipping the pre-write slug check, because that read would consume the one call this grant allows — the write itself would then be refused. Slugs are UNCHECKED. Verify them first with \`wf fields ${collectionId}\` under a read grant if that matters.`
+    );
+  } else {
+    const fieldsRes = await webflowRequest({ profile, method: "GET", path: `collections/${collectionId}`, project });
+    if (!fieldsRes.ok) {
+      die(
+        `Could not verify field slugs before writing (${fieldsRes.error || fieldsRes.errorCode}).`,
+        "Fix that first, or pass --no-validate to send without checking (only once you already know the slugs are right)."
+      );
+    }
+    const known = new Set((fieldsRes.data?.fields || []).map((f) => f.slug));
+    const unknown = Object.keys(fieldData).filter((slug) => !known.has(slug));
+    if (unknown.length) {
+      die(
+        `Unknown field slug(s) for collection ${collectionId}: ${unknown.join(", ")}.`,
+        `Known slugs: ${[...known].join(", ") || "(none)"} — or run \`wf fields ${collectionId}\`.`
+      );
+    }
+  }
+
+  if (flagLive) {
+    console.error(`⚠ --live: writing directly to the LIVE (published) item ${itemId} in collection ${collectionId} — this bypasses staging.`);
+    // Not part of the grant/tier model (tierForRequest still prices this PATCH
+    // as "write", same as any other item edit — see lib/grants.mjs) — an extra
+    // LOCAL check this command adds on top, so a copy-pasted item id cannot
+    // silently take a live edit. A human reviewing this may reasonably decide
+    // --live deserves "danger" tier instead; that would be a change to
+    // tierForRequest, which this task's hard constraints say not to loosen —
+    // or tighten — without calling it out, so it is flagged here rather than
+    // done unilaterally.
+    if (flagConfirm !== itemId)
+      die(`--live requires restating the item id to confirm:  --confirm ${itemId}`, "Verify that id is really the intended item before retyping it.");
+  }
+
+  await run({
+    method: "PATCH",
+    path: `collections/${collectionId}/items/${itemId}${flagLive ? "/live" : ""}`,
+    body: { fieldData, ...(isDraft !== undefined ? { isDraft } : {}), ...(isArchived !== undefined ? { isArchived } : {}) }
+  });
+}
+
+// `wf item publish <collectionId> <itemId…>` — typed form of the bulk publish
+// endpoint (POST /collections/{id}/items/publish; 18 hand-assembled calls in
+// the audited window). This command only builds the {itemIds} body — it does
+// NOT get special treatment from the confirm gate. confirmationTargetFor
+// (lib/grants.mjs) already refuses this exact shape closed: the endpoint
+// carries its targets in the request body, not the URL, and there is no
+// locally-proven per-target confirmation for a bulk body, so --confirm cannot
+// bind to one of several item ids the way it binds to a single DELETE's id.
+// That refusal is pre-existing and intentional (identical to
+// `wf call items publish-item` today) — this command does not loosen it, and
+// running it will report the same "cannot be confirmed safely" refusal until
+// a human decides how a bulk target should be confirmed.
+if (cmd === "item" && positionals[1] === "publish") {
+  const collectionId = positionals[2];
+  const itemIds = positionals.slice(3);
+  if (!collectionId || !itemIds.length)
+    die(
+      "Usage: wf item publish <collectionId> <itemId…>",
+      "Publishes staged items to live. Danger tier — see the comment above this command in bin/wf.mjs for why it is refused today."
+    );
+  await run({ method: "POST", path: `collections/${collectionId}/items/publish`, body: { itemIds } });
 }
 
 const shortcuts = {

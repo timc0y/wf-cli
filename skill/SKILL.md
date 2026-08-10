@@ -95,6 +95,10 @@ first, believe it over this file if they ever disagree:
     wf call items create-item --p collection_id=<id> --data '{"fieldData":{…}}'
     wf page-schema <pageId…> --site <id>            # read JSON-LD schema markup (beta)
     wf page-schema set <pageId> --site <id> --file schema.json   # replace it
+    wf fields <collectionId>                       # field table: slug | type | required | displayName
+    wf fields add <collId> --type Reference --name Author --to <targetCollId>
+    wf items set <collId> <itemId> --set slug=value    # typed CMS item write
+    wf item publish <collId> <itemId…>             # bulk publish
     wf audit report                # what happened lately
     wf assets upload <file...> --site <id> [--dir <path>] [--folder <name>] --dry
 
@@ -165,6 +169,64 @@ the typed front end; use it instead of hand-building the envelopes.
 - `--locale <id>` targets a secondary locale. A locale with no markup of its
   own answers with the primary locale's and `isInherited: true` — don't mistake
   that for the locale having its own copy.
+
+## CMS field/item typed commands — `wf fields`, `wf items set`, `wf item publish`
+
+Four commands built directly from an audit of real CMS write failures — every
+one of them was a field/item shape mistake, not a permissions problem. Use
+these instead of hand-assembling `--data` for the endpoints they cover.
+
+    wf fields <collectionId>                                     # slug | type | required | displayName table
+    wf fields add <collId> --type Reference --name Author --to <targetCollId>
+    wf fields add <collId> --type Option --name Status --options draft,live
+    wf items set <collId> <itemId> --set name=Acme --set slug=acme-ltd
+    wf items set <collId> <itemId> --draft true --archived false
+    wf item publish <collId> <itemId…>
+
+**`wf fields`** reads the collection's fields as a table instead of raw JSON —
+same idea as `wf sites`. There's no separate "list fields" endpoint; Webflow
+returns fields inline on `GET /collections/{id}`, which is what this reads.
+Raw JSON: `wf call collections get --p collection_id=<id>`.
+
+**`wf items set`** wraps every `--set slug=value` into `fieldData` for you —
+the historical mistake ("Body should have required property 'fieldData'")
+happens when a slug is written beside `fieldData` instead of inside it, and
+that isn't reachable from this command at all. Before sending, it fetches the
+collection's real fields (one extra read call) and refuses an unknown slug by
+name. That check needs live data, so it does NOT run under `--check` or
+`--dry` (both stay network-free by design) or `--no-validate` — each of those
+says so rather than silently behaving as if the slugs were confirmed.
+`--set` values are always strings on the command line; coercion is explicit:
+`"true"`/`"false"` → boolean, a bare integer/decimal → number, something
+shaped like JSON (`{...}`/`[...]`) → parsed JSON (refused loudly if it fails
+to parse), anything else stays a string. A field whose real value should be
+the literal text `"true"` or a number-looking string needs
+`wf call items update-item --data …` instead. `--draft`/`--archived` take an
+explicit `true`/`false` (they map straight to `isDraft`/`isArchived`).
+
+`--live` writes the item's LIVE (published) copy directly
+(`.../items/{id}/live`) instead of the staged one — it bypasses the normal
+publish step, so it prints a loud warning and additionally requires restating
+the item id via `--confirm <id>` before it will send. This is a local check
+this command adds on top of the grant's own tier — the tier itself is
+unchanged (still "write", the same as any other item edit).
+
+**`wf fields add`** is typed field creation for the other historical failure:
+"Reference fields must have a collectionId". `--type Reference`/
+`--type MultiReference` require `--to <collectionId>` (becomes
+`metadata.collectionId`); `--type Option` requires `--options a,b,c` (becomes
+`metadata.options`, one `{name}` object per choice — from the Data API docs,
+unverified against a live call in this repo). Missing either is refused
+locally with the exact flag to add. The same rule is now also enforced on the
+`fields/create` contract itself (`requiredWhen` in lib/schemas.mjs), so
+`wf call fields create` gets the same protection even without this command.
+
+**`wf item publish`** builds `{itemIds: […]}` for the bulk publish endpoint.
+It does not get special treatment from the confirm gate: that endpoint carries
+its targets in the request body, not the URL, so there is no id for
+`--confirm` to bind to the way it binds a single DELETE — the call is refused
+closed today, the same as `wf call items publish-item`. This command does not
+change that; it only saves you from hand-building the body.
 
 ## Asset upload — `wf assets upload`
 
@@ -247,8 +309,10 @@ that rarely changes. Hybrid is fine — a static page with CMS-driven sections
   `--dry` previews the exact request. Both are free and send nothing.
 - **A field slug goes inside `fieldData`, never beside it.** `{"name": "Acme"}`
   on an item write is accepted, ignored, and answered with 200: the call looks
-  like it worked and the item is untouched. `--check` refuses that body, and
-  `wf call fields list --p collection_id=<id>` gives you the real slugs.
+  like it worked and the item is untouched. `wf items set` makes this
+  structurally impossible (every `--set` lands inside `fieldData`); for a raw
+  `wf call`, `--check` refuses the bad body, and `wf fields <collectionId>`
+  gives you the real slugs.
 - **Confirm items exist before calling a listing page complete.** An empty
   collection is a blocker to report, not a reason to invent sample content.
 
