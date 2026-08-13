@@ -26,6 +26,7 @@ const { CODES } = await import("../lib/error-codes.mjs");
 const { resolveCallEndpoint } = await import("../lib/catalog.mjs");
 const { contractFor, validateBody } = await import("../lib/schemas.mjs");
 const { parseCliArgs } = await import("../lib/argv.mjs");
+const { buildFieldUpdateBatch, buildFieldUpdateBody, preflightFieldUpdateBatch, verifyFieldUpdate, verifyFieldUpdateBatch } = await import("../lib/fields.mjs");
 
 const SITE_A = "aaaaaaaaaaaaaaaaaaaaaaaa";
 const COLLECTION = "cccccccccccccccccccccccc";
@@ -37,6 +38,95 @@ describe("wf fields — reads the existing collections/get endpoint", () => {
     const ep = resolveCallEndpoint("collections", "get", { collection_id: COLLECTION });
     assert.equal(ep.method, "GET");
     assert.equal(ep.path, "/collections/{collection_id}");
+  });
+});
+
+describe("wf fields update — narrow metadata body plus fresh-read verification", () => {
+  it("constructs only documented mutable metadata", () => {
+    const built = buildFieldUpdateBody({ displayName: "Editorial summary", helpText: "Shown to editors", isRequired: false });
+    assert.deepEqual(built, {
+      ok: true,
+      body: { displayName: "Editorial summary", helpText: "Shown to editors", isRequired: false }
+    });
+    assert.deepEqual(buildFieldUpdateBody({}), { ok: false, error: "Pass at least one of --name, --help-text, or --is-required true|false." });
+  });
+
+  it("verifies the same field id from a fresh collection readback", () => {
+    const collection = { fields: [{ id: "field-1", displayName: "Editorial summary", helpText: "Shown to editors", isRequired: false }] };
+    assert.deepEqual(
+      verifyFieldUpdate({
+        collection,
+        fieldId: "field-1",
+        expected: { displayName: "Editorial summary", helpText: "Shown to editors", isRequired: false }
+      }),
+      { ok: true, field: collection.fields[0] }
+    );
+  });
+
+  it("refuses a stale or mismatched readback instead of treating PATCH acknowledgement as success", () => {
+    const result = verifyFieldUpdate({
+      collection: { fields: [{ id: "field-1", displayName: "Old", helpText: "Shown to editors", isRequired: false }] },
+      fieldId: "field-1",
+      expected: { displayName: "Editorial summary" }
+    });
+    assert.equal(result.ok, false);
+    assert.deepEqual(result.mismatched, ["displayName"]);
+  });
+
+  it("validates a strict batch manifest and verifies every field from one fresh readback", () => {
+    const batch = buildFieldUpdateBatch([
+      { fieldId: "field-1", displayName: "Editorial summary", helpText: "Shown to editors" },
+      { fieldId: "field-2", isRequired: false }
+    ]);
+    assert.equal(batch.ok, true);
+    assert.deepEqual(
+      verifyFieldUpdateBatch({
+        collection: {
+          fields: [
+            { id: "field-1", displayName: "Editorial summary", helpText: "Shown to editors" },
+            { id: "field-2", isRequired: false }
+          ]
+        },
+        updates: batch.updates
+      }).ok,
+      true
+    );
+    assert.match(buildFieldUpdateBatch([{ fieldId: "field-1", typo: true }]).error, /unsupported key/);
+    assert.match(
+      buildFieldUpdateBatch([
+        { fieldId: "field-1", displayName: "Same" },
+        { fieldId: "field-2", displayName: "same" }
+      ]).error,
+      /repeats displayName/
+    );
+  });
+
+  it("preflights every target and never starts a batch into a live label collision", () => {
+    const collection = {
+      fields: [
+        { id: "field-1", displayName: "Card image" },
+        { id: "field-2", displayName: "Hero image" }
+      ]
+    };
+    assert.deepEqual(preflightFieldUpdateBatch({ collection, updates: [{ fieldId: "field-1", body: { helpText: "Shown on cards." } }] }), { ok: true });
+    assert.match(
+      preflightFieldUpdateBatch({ collection, updates: [{ fieldId: "missing", body: { helpText: "Shown on cards." } }] }).error,
+      /no longer has field\(s\): missing/
+    );
+    assert.match(
+      preflightFieldUpdateBatch({ collection, updates: [{ fieldId: "field-1", body: { displayName: "hero image" } }] }).error,
+      /currently uses that label/
+    );
+    assert.match(
+      preflightFieldUpdateBatch({
+        collection,
+        updates: [
+          { fieldId: "field-1", body: { displayName: "Hero image" } },
+          { fieldId: "field-2", body: { displayName: "Feature image" } }
+        ]
+      }).error,
+      /temporary label/
+    );
   });
 });
 
@@ -82,6 +172,11 @@ describe("wf items set — the exact body it assembles", () => {
   it("parses repeated --set flags the same way --p/--q are parsed (keyValueMap)", () => {
     const parsed = parseCliArgs(["items", "set", COLLECTION, ITEM, "--set", "name=Acme", "--set", "url=https://a.com/x=y"]);
     assert.deepEqual(parsed.setFields, { name: "Acme", url: "https://a.com/x=y" });
+  });
+
+  it("keeps update's required state explicit so it can safely set false", () => {
+    const parsed = parseCliArgs(["fields", "update", COLLECTION, "field-1", "--is-required", "false"]);
+    assert.equal(parsed.flagIsRequired, "false");
   });
 
   it("--draft/--archived take an explicit true|false, not a bare presence flag", () => {

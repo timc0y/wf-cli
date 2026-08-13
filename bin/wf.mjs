@@ -39,8 +39,10 @@
 //   wf call items list-items --p collection_id=<id> --q limit=5
 //   wf call items create-item --p collection_id=<id> --data '{"fieldData":{…}}'
 //   wf collections <siteId> | collection <id> | items <colId> | pages <siteId> | publish <siteId>
-//   wf fields <collectionId>                                      field table: slug | type | required | displayName
+//   wf fields <collectionId> [--json]                             table, or complete field metadata as JSON
 //   wf fields add <collId> --type <Type> --name <Name> [--to <id>] [--options a,b,c]
+//   wf fields update <collId> <fieldId> [--name <Name>] [--help-text <text>] [--is-required true|false]
+//   wf fields update <collId> --file field-updates.json           one collection, one final server readback
 //   wf items set <collId> <itemId> --set slug=value […] [--draft true|false] [--archived true|false] [--live]
 //   wf item publish <collId> <itemId…>                            bulk publish (danger; --confirm the id set)
 //   wf page-schema <pageId…> --site <siteId> [--locale <id>]      JSON-LD schema markup (beta)
@@ -100,6 +102,7 @@ import { parseTtl, readJsonDetail } from "../lib/config.mjs";
 import { diagnose, formatDiagnosis, formatReference } from "../lib/doctor.mjs";
 import { ENDPOINTS } from "../lib/endpoints.mjs";
 import { CODES } from "../lib/error-codes.mjs";
+import { buildFieldUpdateBatch, buildFieldUpdateBody, preflightFieldUpdateBatch, verifyFieldUpdate, verifyFieldUpdateBatch } from "../lib/fields.mjs";
 import { MS_PER_DAY, describeGrant, getGrant, isFailure, issueGrant, listGrants, readAudit, revokeAll, revokeGrant } from "../lib/grants.mjs";
 import { offloadIfLarge } from "../lib/offload.mjs";
 import {
@@ -168,6 +171,7 @@ const {
   flagTo,
   flagOptions,
   flagRequired,
+  flagIsRequired,
   flagHelpText,
   flagSlug
 } = parseCliArgs(process.argv.slice(2));
@@ -648,7 +652,7 @@ const validateOrDie = ({ method, path, body }) => {
   return { endpoint, checked };
 };
 
-const run = async ({ method, path, query: q2, body }, render = null) => {
+const request = async ({ method, path, query: q2, body }) => {
   // webflowRequest (below) now enforces this same pin itself — see
   // lib/client.mjs — so this is no longer the only thing standing between a
   // wrong-client path and the network. It stays here anyway: checkSitePin is
@@ -680,7 +684,11 @@ const run = async ({ method, path, query: q2, body }, render = null) => {
     process.exit(0);
   }
 
-  out(await webflowRequest({ profile, method, path, query: q2, body, dryRun, confirm: flagConfirm, project }), { path, method }, render);
+  return webflowRequest({ profile, method, path, query: q2, body, dryRun, confirm: flagConfirm, project });
+};
+
+const run = async ({ method, path, query: q2, body }, render = null) => {
+  out(await request({ method, path, query: q2, body }), { path, method }, render);
 };
 
 const bodyFromFlags = () => {
@@ -1077,28 +1085,29 @@ if (cmd === "collections" && positionals[1] === "refresh") {
   process.exit(failed ? 1 : 0);
 }
 
-// `wf fields <collectionId>` — a collection's field list as a table (slug |
+// `wf fields <collectionId>` — a collection's field list as a table (id | slug |
 // type | required | displayName), the way `wf sites` prints a table instead
 // of the raw JSON. There is no dedicated "list fields" endpoint — Webflow
 // returns a collection's fields inline on GET /collections/{collection_id}
 // (the existing `collections/get` entry in lib/endpoints.mjs), so this reuses
-// it rather than inventing a new one. Raw JSON stays reachable via
-// `wf call collections get --p collection_id=<id>` or `wf get collections/<id>`.
+// it rather than inventing a new one. `--json` prints only the fields so an
+// agent can build a metadata manifest without extracting a raw collection.
 const renderFieldsTable = (data) => {
   const fields = Array.isArray(data?.fields) ? data.fields : [];
   if (!fields.length) return "(collection has no fields)";
   const rows = [
-    ["slug", "type", "required", "displayName"],
-    ...fields.map((f) => [f.slug ?? "", f.type ?? "", f.isRequired ? "yes" : "no", f.displayName ?? ""])
+    ["id", "slug", "type", "required", "displayName"],
+    ...fields.map((f) => [f.id ?? "", f.slug ?? "", f.type ?? "", f.isRequired ? "yes" : "no", f.displayName ?? ""])
   ];
   const widths = rows[0].map((_, col) => Math.max(...rows.map((row) => String(row[col]).length)));
   return rows.map((row) => row.map((cell, col) => String(cell).padEnd(widths[col])).join("  ")).join("\n");
 };
 
-if (cmd === "fields" && positionals[1] !== "add") {
+if (cmd === "fields" && !["add", "update"].includes(positionals[1])) {
   const collectionId = positionals[1];
   if (!collectionId) die("Usage: wf fields <collectionId>", "wf collections <siteId> to find a collection id first. `wf fields add …` creates a field.");
-  await run({ method: "GET", path: `collections/${collectionId}` }, renderFieldsTable);
+  const render = flagJson ? (data) => JSON.stringify(Array.isArray(data?.fields) ? data.fields : [], null, 2) : renderFieldsTable;
+  await run({ method: "GET", path: `collections/${collectionId}` }, render);
 }
 
 // `wf fields add <collectionId> --type <Type> --name <DisplayName> […]` —
@@ -1148,6 +1157,154 @@ if (cmd === "fields" && positionals[1] === "add") {
     ...(Object.keys(metadata).length ? { metadata } : {})
   };
   await run({ method: "POST", path: `collections/${collectionId}/fields`, body });
+}
+
+// `wf fields update <collectionId> <fieldId>` owns the documented scalar
+// metadata fields. Group membership and order have no Data API representation;
+// those stay in the Designer layer. A PATCH acknowledgement is intentionally
+// not success here: fetch the parent collection again and prove the exact
+// field contains every requested value before reporting completion.
+if (cmd === "fields" && positionals[1] === "update") {
+  const collectionId = positionals[2];
+  const fieldId = positionals[3];
+  if (!collectionId)
+    die(
+      "Usage: wf fields update <collectionId> <fieldId> [--name <DisplayName>] [--help-text <text>] [--is-required true|false] | wf fields update <collectionId> --file updates.json",
+      "wf fields <collectionId> lists the field ids and current metadata."
+    );
+  if (file) {
+    if (fieldId) die("Use either <fieldId> flags or --file updates.json, not both.");
+    let parsed;
+    try {
+      parsed = JSON.parse(readFileSync(resolve(process.cwd(), file), "utf8"));
+    } catch (error) {
+      die(`Could not read field update file "${file}": ${error.message}`);
+    }
+    const batch = buildFieldUpdateBatch(parsed);
+    if (!batch.ok) die(batch.error);
+    const paths = batch.updates.map(({ fieldId: id }) => `collections/${collectionId}/fields/${id}`);
+    if (flagCheck) {
+      for (const [index, update] of batch.updates.entries()) validateOrDie({ method: "PATCH", path: paths[index], body: update.body });
+      console.log(`✓ --check: ${batch.updates.length} field update(s) match the documented PATCH contract. Nothing was sent.`);
+      process.exit(0);
+    }
+    if (!dryRun) {
+      const preflightPath = `collections/${collectionId}`;
+      const current = await request({ method: "GET", path: preflightPath });
+      if (!current.ok) out(current, { path: preflightPath, method: "GET" });
+      const preflight = preflightFieldUpdateBatch({ collection: current.data, updates: batch.updates });
+      if (!preflight.ok) out({ ok: false, errorCode: CODES.WF_FIELD_BATCH_PREFLIGHT, error: preflight.error }, { path: preflightPath, method: "GET" });
+    }
+    const applied = [];
+    const previews = [];
+    for (const [index, update] of batch.updates.entries()) {
+      const written = await request({ method: "PATCH", path: paths[index], body: update.body });
+      if (!written.ok) {
+        const reread = await request({ method: "GET", path: `collections/${collectionId}` });
+        const partial = reread.ok ? verifyFieldUpdateBatch({ collection: reread.data, updates: applied }) : null;
+        out(
+          {
+            ...written,
+            error: `Batch stopped at field ${update.fieldId}: ${written.error || "PATCH failed"}`,
+            details: {
+              applied: applied.length,
+              verifiedApplied: partial?.ok === true,
+              verification: partial?.failures || null,
+              remaining: batch.updates.slice(index).map(({ fieldId: id }) => id)
+            }
+          },
+          { path: paths[index], method: "PATCH" }
+        );
+      }
+      if (written.dryRun) previews.push(written.data?.wouldSend);
+      else applied.push(update);
+    }
+    if (dryRun) {
+      console.log(JSON.stringify({ wouldSend: previews, note: `--dry: ${batch.updates.length} field PATCH request(s); nothing was sent.` }, null, 2));
+      process.exit(0);
+    }
+    const readbackPath = `collections/${collectionId}`;
+    const reread = await request({ method: "GET", path: readbackPath });
+    if (!reread.ok)
+      out(
+        {
+          ...reread,
+          errorCode: CODES.WF_WRITE_UNVERIFIED,
+          error: `Field batch completed but fresh collection readback failed: ${reread.error || "unknown read error"}`
+        },
+        { path: readbackPath, method: "GET" }
+      );
+    const verification = verifyFieldUpdateBatch({ collection: reread.data, updates: batch.updates });
+    if (!verification.ok)
+      out(
+        { ok: false, errorCode: CODES.WF_WRITE_UNVERIFIED, error: "The field batch did not fully persist.", details: verification.failures },
+        { path: readbackPath, method: "GET" }
+      );
+    out(
+      {
+        ok: true,
+        data: {
+          changed: batch.updates.map(({ fieldId: id, body }) => ({ fieldId: id, keys: Object.keys(body) })),
+          verification: { verified: true, collectionId, fieldIds: batch.updates.map(({ fieldId: id }) => id), source: "fresh_collection_readback" }
+        }
+      },
+      { path: readbackPath, method: "GET" }
+    );
+  }
+  if (!fieldId)
+    die(
+      "Usage: wf fields update <collectionId> <fieldId> [--name <DisplayName>] [--help-text <text>] [--is-required true|false] | wf fields update <collectionId> --file updates.json",
+      "wf fields <collectionId> lists the field ids and current metadata."
+    );
+  if (flagName != null && !flagName.trim()) die("--name cannot be empty.");
+  const isRequired = parseBoolFlag(flagIsRequired, "is-required");
+  const built = buildFieldUpdateBody({
+    ...(flagName != null ? { displayName: flagName } : {}),
+    ...(flagHelpText != null ? { helpText: flagHelpText } : {}),
+    ...(isRequired !== undefined ? { isRequired } : {})
+  });
+  if (!built.ok) die(built.error);
+
+  const path = `collections/${collectionId}/fields/${fieldId}`;
+  const written = await request({ method: "PATCH", path, body: built.body });
+  if (!written.ok || written.dryRun) out(written, { path, method: "PATCH" });
+
+  const readbackPath = `collections/${collectionId}`;
+  const reread = await request({ method: "GET", path: readbackPath });
+  if (!reread.ok) {
+    out(
+      {
+        ...reread,
+        errorCode: CODES.WF_WRITE_UNVERIFIED,
+        error: `Field PATCH completed but fresh collection readback failed: ${reread.error || "unknown read error"}`
+      },
+      { path: readbackPath, method: "GET" }
+    );
+  }
+  const verification = verifyFieldUpdate({ collection: reread.data, fieldId, expected: built.body });
+  if (!verification.ok)
+    out(
+      {
+        ok: false,
+        status: written.status,
+        errorCode: CODES.WF_WRITE_UNVERIFIED,
+        error: verification.error,
+        details: { expected: built.body, field: verification.field, mismatched: verification.mismatched || [] }
+      },
+      { path: readbackPath, method: "GET" }
+    );
+  out(
+    {
+      ok: true,
+      status: written.status,
+      data: {
+        field: verification.field,
+        changed: built.body,
+        verification: { verified: true, collectionId, fieldId, source: "fresh_collection_readback" }
+      }
+    },
+    { path, method: "PATCH" }
+  );
 }
 
 // `wf items set <collectionId> <itemId> --set slug=value […]` — typed CMS
