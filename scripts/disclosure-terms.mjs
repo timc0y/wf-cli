@@ -31,4 +31,19 @@ export const FORBIDDEN_TERMS = [
  * Client and workspace names that have appeared in this repo's history, plus any
  * that get added later. Lowercase substrings, matched case-insensitively.
  */
-export const CLIENT_TERMS = ["spurwing", "exec-life", "execlife", "executive life", "crux"];
+export const CLIENT_TERMS = [
+  "spurwing",
+  "exec-life",
+  "execlife",
+  "executive life",
+  "crux",
+  "suttons",
+  "aethos",
+  "getreal",
+  "get real",
+  "greggs",
+  "bluesleep",
+  "music can",
+  "sitecare",
+  "sparkadvisors"
+];
