@@ -1,4 +1,4 @@
 interface:
-  display_name: "Webflow Data API"
+  display_name: "Webflow Data API CLI"
   short_description: "Read or change Webflow data with approved access"
-  default_prompt: "Use $wf to read or change the named Webflow site after a person grants access, then read the result back."
+  default_prompt: "Use $wf-cli to inspect or change the named Webflow site through the wf command after a person grants access, then prove the result with a fresh read-back."

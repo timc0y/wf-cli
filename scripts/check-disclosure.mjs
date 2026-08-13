@@ -82,7 +82,7 @@ const assertSkillPackaging = () => {
   const skillFile = join(ROOT, "skill", "SKILL.md");
   const metadataFile = join(ROOT, "skill", "agents", "openai.yaml");
   const skill = readFileSync(skillFile, "utf8");
-  if (!/^---\r?\n[\s\S]*?^name:\s*wf\s*$[\s\S]*?^description:/m.test(skill)) {
+  if (!/^---\r?\n[\s\S]*?^name:\s*wf-cli\s*$[\s\S]*?^description:/m.test(skill)) {
     problems.push("skill/SKILL.md needs loadable name/description frontmatter");
   }
   if (skill.split(/\r?\n/).length > 350) problems.push("skill/SKILL.md exceeds the project limit of 350 lines; move detail into references");
@@ -111,7 +111,7 @@ const assertSkillPackaging = () => {
     for (const field of ["display_name:", "short_description:", "default_prompt:"]) {
       if (!metadata.includes(field)) problems.push(`skill/agents/openai.yaml is missing ${field}`);
     }
-    if (!metadata.includes("$wf")) problems.push("skill/agents/openai.yaml default prompt must invoke $wf");
+    if (!metadata.includes("$wf-cli")) problems.push("skill/agents/openai.yaml default prompt must invoke $wf-cli");
     for (const phrase of DENSE_PROSE_PHRASES) {
       if (metadata.toLowerCase().includes(phrase)) problems.push(`skill/agents/openai.yaml uses dense prose phrase ${JSON.stringify(phrase)}`);
     }

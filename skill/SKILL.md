@@ -1,15 +1,16 @@
 ---
-name: wf
+name: wf-cli
 description: >-
-  Read or change Webflow CMS data and site settings with the `wf` CLI. Use for
+  Use the `wf` CLI to read or change Webflow CMS data and site settings. Use for
   collections, fields, items, pages, SEO data, assets, forms, redirects,
   localisation or publishing through the Webflow Data API. The command only
   works after a person grants access to the named site.
 ---
 
-# wf — safe Webflow Data API access
+# Webflow Data API CLI
 
-Use `wf` for every call to api.webflow.com. It can change real client sites, so a
+Use the `wf-cli` skill for every call to api.webflow.com, then run the `wf`
+command. It can change real client sites, so a
 person must grant access to the named site before a network call can run. Follow
 the command's safety checks.
 
@@ -17,6 +18,16 @@ The tool's own help is the current source. Run this first and follow it if this
 file ever disagrees:
 
     wf help agents
+
+Use the shared operating shape: `boundary → contract → selection → profile → execution → evidence → outcome → replay`.
+
+## Contract and operation profile
+
+Bind every operation to the resolved profile, 24-character Data API site ID,
+resource identity, requested fields, permission tier, call budget, and read-back.
+Use `inspect`, `preview`, `write`, or `danger`; never silently escalate between
+them. A Designer short name is not a Data API site ID. A dry run proves request
+shape only, while a fresh read proves the resulting Webflow state.
 
 ## Always work in this order
 
@@ -32,6 +43,10 @@ file ever disagrees:
    line and stop until they run it.
 6. Run the command, then read the result back. Some Webflow endpoints ignore
    unrecognised keys while still returning a success response.
+
+The operation is complete only when the fresh read-back identifies the same site
+and resource, proves the requested fields, and exposes any partial or ignored
+result. A successful HTTP response alone is not completion.
 
 ## Safety rules
 
