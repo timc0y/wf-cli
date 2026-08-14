@@ -55,11 +55,14 @@
 //   --dry on any invoke prints the exact request without sending.
 //   DELETE / publish / webhook creation also require --confirm <target-id>.
 //   NOTE: collection/item/field paths address a collection id, not a site id,
-//   so they can't be checked against a grant's site from the URL alone. `wf
-//   grant` auto-refreshes a collection->site cache for the granted site(s)
-//   (also `wf collections refresh --sites <ids>` standalone) so these calls
-//   CAN be verified; an uncached collection fails closed, same as any other
-//   site mismatch.
+//   and single-page paths (pages/{page_id}, e.g. get-metadata,
+//   update-page-settings) address a page id, not a site id — neither can be
+//   checked against a grant's site from the URL alone. `wf grant`
+//   auto-refreshes a collection->site AND a page->site cache for the granted
+//   site(s) (also `wf collections refresh --sites <ids>` and `wf pages
+//   refresh --sites <ids>` standalone) so these calls CAN be verified; an
+//   uncached collection or page fails closed, same as any other site
+//   mismatch.
 //
 // GRANTS (human-only; run these yourself, agents will ask you to):
 //   wf grant acme --sites acme-marketing --ttl 8h                 read-only for the day
@@ -69,6 +72,7 @@
 //      from the last `wf sites` — or the raw 24-hex id; scope = endpoint
 //      groups from `wf ls`; budgets default 100 write/20 danger)
 //   wf collections refresh --sites <ids>    refresh the collection->site cache (free, no grant)
+//   wf pages refresh --sites <ids>          refresh the page->site cache (free, no grant)
 //   wf grants | wf revoke acme | wf revoke --all
 //   wf audit report [--days 7]             what actually happened, with durations + errors
 //   wf audit fails [--days 7]              only the failing calls, full error + body detail
@@ -97,7 +101,7 @@ import {
   uploadAssetFile
 } from "../lib/assets.mjs";
 import { endpointForRequest, knownGroups, resolveCallEndpoint } from "../lib/catalog.mjs";
-import { listCollectionsFree, listSitesFree, listSitesFreeAllProfiles, webflowRequest } from "../lib/client.mjs";
+import { listCollectionsFree, listPagesFree, listSitesFree, listSitesFreeAllProfiles, webflowRequest } from "../lib/client.mjs";
 import { parseTtl, readJsonDetail } from "../lib/config.mjs";
 import { diagnose, formatDiagnosis, formatReference } from "../lib/doctor.mjs";
 import { ENDPOINTS } from "../lib/endpoints.mjs";
@@ -107,6 +111,7 @@ import { MS_PER_DAY, describeGrant, getGrant, isFailure, issueGrant, listGrants,
 import { offloadIfLarge } from "../lib/offload.mjs";
 import {
   cacheCollections,
+  cachePages,
   cacheSites,
   getCachedSites,
   listProfiles,
@@ -511,6 +516,21 @@ if (cmd === "grant") {
       else
         console.error(
           `(could not refresh collection cache for site ${siteId}: ${res.error} — collections/items calls for it may fail closed until \`wf collections refresh\` succeeds)`
+        );
+    }
+  }
+
+  // Same best-effort refresh, same reason, for the page -> site cache: pages
+  // endpoints addressed by bare page_id carry no site id in the URL either,
+  // so a fresh grant with no cached pages yet would fail closed on the very
+  // next `pages get-metadata` / `update-page-settings` call.
+  for (const p of profiles) {
+    for (const siteId of siteIds) {
+      const res = await listPagesFree(p, siteId);
+      if (res.ok) cachePages(p, siteId, res.pages);
+      else
+        console.error(
+          `(could not refresh page cache for site ${siteId}: ${res.error} — pages calls for it may fail closed until \`wf pages refresh\` succeeds)`
         );
     }
   }
@@ -1077,6 +1097,36 @@ if (cmd === "collections" && positionals[1] === "refresh") {
     if (res.ok) {
       cacheCollections(profile, id, res.collections);
       console.log(`✓ ${id}: cached ${res.collections.length} collection(s)`);
+    } else {
+      failed++;
+      console.error(`✗ ${id}: ${res.error}`);
+    }
+  }
+  process.exit(failed ? 1 : 0);
+}
+
+// `wf pages refresh --sites <name-or-id>[,…]` — free (no grant), refills the
+// page -> site cache grants.mjs's site-scoping check relies on for
+// pages/{page_id} paths (see the comment there). Same shape as `wf
+// collections refresh` above, for the same reason: doesn't shadow the
+// existing `wf pages <siteId>` shortcut — only fires when the second
+// positional is literally "refresh".
+if (cmd === "pages" && positionals[1] === "refresh") {
+  if (!flagSites) die("Usage: wf pages refresh --sites <name-or-id>[,…] [--profile p]");
+  if (!profile) die("No profile resolved. Pass --profile <name>.");
+  const resolved = resolveSiteIds(profile, flagSites);
+  if (!resolved.ok)
+    die(
+      `Could not resolve "${resolved.unresolved}" to a site id for profile "${profile}".`,
+      "Run `wf sites` (free, no grant needed) first, or pass the 24-hex id directly."
+    );
+  const ids = resolved.ids;
+  let failed = 0;
+  for (const id of ids) {
+    const res = await listPagesFree(profile, id);
+    if (res.ok) {
+      cachePages(profile, id, res.pages);
+      console.log(`✓ ${id}: cached ${res.pages.length} page(s)`);
     } else {
       failed++;
       console.error(`✗ ${id}: ${res.error}`);

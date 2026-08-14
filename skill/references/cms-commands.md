@@ -14,11 +14,53 @@ wf items set <collId> <itemId> --draft true --archived false
 wf item publish <collId> <itemId…>
 ```
 
+## In this file
+
+- Read collection fields
+- Audit help-text coverage across a site
+- Update field metadata
+- Edit an item
+- Add a field
+- Publish items
+
 ## Read collection fields
 
 `wf fields` shows each field's id, slug, type, required state and display name.
 Use the id as `<fieldId>` for `wf fields update`. Add `--json` to receive only
 the complete field records, including help text, in a manifest-friendly form.
+
+## Audit help-text coverage across a site
+
+Help text is the only place a collection explains itself to whoever fills it in.
+A field named `Show if`, `Sort order` or `Hide on listing` is unusable without
+one, so coverage is worth measuring before a handover rather than after the first
+support question.
+
+Read every collection, then every collection's fields as JSON, and count:
+
+```bash
+wf collections <siteId>
+wf fields <collectionId> --json
+```
+
+Two rules make the number mean something:
+
+- **Count author-facing fields only.** Webflow's own system fields — `Name`,
+  `Slug`, `Archived`, `Draft`, `Created On`, `Updated On`, `Published On`,
+  `Created By`, `Updated By`, `Published By` — cannot carry help text. Leaving
+  them in the denominator understates every site by roughly the same wrong
+  amount: one real collection set measured 24% against all fields and 54%
+  against the fields an author can annotate.
+- **Weight by whether the value explains itself.** A plain-text field called
+  `Headline` needs no help text. A reference, an option, a switch or a bare
+  number cannot be understood from its value alone, so an undocumented one of
+  those is a genuine gap while an undocumented headline is not.
+
+Report the collections with no help text at all separately: a collection where
+nobody has written any is a different problem from one that is merely patchy.
+
+Write the results back with `wf fields update --file`, one collection per batch,
+so each change is proved by a fresh readback.
 
 ## Update field metadata
 

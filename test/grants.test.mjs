@@ -315,13 +315,21 @@ describe("guardrails v2 — site scoping (2026-07-27: mandatory, not opt-in)", (
     assert.equal(res.ok, true);
   });
 
-  it("fails closed when a bare asset, page, or webhook id has no site to verify", () => {
+  it("fails closed when a bare asset or webhook id has no site to verify", () => {
     grants.issueGrant({ profile: "sitecheck", tier: "danger", ttlMs: 60_000, siteIds: [SITE_A] });
-    for (const resource of ["assets", "pages", "webhooks"]) {
+    for (const resource of ["assets", "webhooks"]) {
       const res = grants.authorize({ profile: "sitecheck", method: "DELETE", path: `${resource}/${SITE_A}` });
       assert.equal(res.ok, false, resource);
       assert.match(res.error, /cannot be verified/i);
     }
+  });
+
+  it("fails closed on a bare page id too, but via the page cache miss, not the generic refusal (see the page -> site scoping suite below)", () => {
+    grants.issueGrant({ profile: "sitecheck", tier: "danger", ttlMs: 60_000, siteIds: [SITE_A] });
+    const res = grants.authorize({ profile: "sitecheck", method: "DELETE", path: `pages/${SITE_A}` });
+    assert.equal(res.ok, false);
+    assert.match(res.error, /site-scoping cache/);
+    assert.match(res.hint, /wf pages refresh --sites/);
   });
 
   it("matches percent-encoded site paths and still refuses a different encoded site", () => {
@@ -343,6 +351,10 @@ describe("guardrails v2 — site scoping (2026-07-27: mandatory, not opt-in)", (
 
   it("fails closed for site-owned resource ids and percent-encoded path variants", () => {
     grants.issueGrant({ profile: "sitecheck", tier: "read", ttlMs: 60_000, siteIds: [SITE_A] });
+    // pages/page-a still belongs in this loop: uncached, it now goes through
+    // the page cache miss instead of the old generic refusal, but that
+    // message still says "site-scoped", so it still matches this regex — see
+    // the page -> site scoping suite below for the cache's exact wording.
     for (const path of ["assets/asset-a", "%61ssets/asset-a", "pages/page-a", "webhooks/webhook-a", "webhooks%2Fwebhook-a"]) {
       const res = grants.authorize({ profile: "sitecheck", method: "GET", path });
       assert.equal(res.ok, false, path);
@@ -427,6 +439,65 @@ describe("collection -> site scoping (closes the collections/items URL gap)", ()
     assert.equal(ok.ok, true);
     const denied = grants.authorize({ profile: "colcheck", method: "PATCH", path: `collections/${COL_UNKNOWN}/fields/some-field` });
     assert.equal(denied.ok, false);
+  });
+});
+
+describe("page -> site scoping (closes the pages/{page_id} URL gap)", () => {
+  beforeEach(() => grants.revokeAll());
+  const PAGE_A = "eeeeeeeeeeeeeeeeeeeeeeee"; // belongs to SITE_A once cached
+  const PAGE_UNKNOWN = "ffffffffffffffffffffffff"; // never cached
+
+  it("fails CLOSED on an uncached page, even with an active site-scoped grant", () => {
+    profiles.setToken("pagecheck", "tok_1234567890abcdefghij", { preferFile: true });
+    grants.issueGrant({ profile: "pagecheck", tier: "write", ttlMs: 60_000, siteIds: [SITE_A] });
+    const res = grants.authorize({ profile: "pagecheck", method: "PUT", path: `pages/${PAGE_UNKNOWN}` });
+    assert.equal(res.ok, false);
+    assert.match(res.error, /site-scoping cache/);
+    assert.match(res.hint, /wf pages refresh --sites/);
+  });
+
+  it("allows a page call once cached to a site the grant covers — this is the exact bug a fresh `wf grant` then `pages update-page-settings` hit", () => {
+    profiles.setToken("pagecheck", "tok_1234567890abcdefghij", { preferFile: true });
+    profiles.cachePages("pagecheck", SITE_A, [{ id: PAGE_A }]);
+    grants.issueGrant({ profile: "pagecheck", tier: "write", ttlMs: 60_000, siteIds: [SITE_A] });
+    const res = grants.authorize({ profile: "pagecheck", method: "PUT", path: `pages/${PAGE_A}` });
+    assert.equal(res.ok, true);
+  });
+
+  it("also allows a plain read (get-metadata) once the page is cached", () => {
+    profiles.setToken("pagecheck", "tok_1234567890abcdefghij", { preferFile: true });
+    profiles.cachePages("pagecheck", SITE_A, [{ id: PAGE_A }]);
+    grants.issueGrant({ profile: "pagecheck", tier: "read", ttlMs: 60_000, siteIds: [SITE_A] });
+    const res = grants.authorize({ profile: "pagecheck", method: "GET", path: `pages/${PAGE_A}` });
+    assert.equal(res.ok, true);
+  });
+
+  it("refuses a cached page that belongs to a different site than the grant", () => {
+    profiles.setToken("pagecheck", "tok_1234567890abcdefghij", { preferFile: true });
+    profiles.cachePages("pagecheck", SITE_B, [{ id: PAGE_A }]); // PAGE_A actually belongs to SITE_B
+    grants.issueGrant({ profile: "pagecheck", tier: "write", ttlMs: 60_000, siteIds: [SITE_A] }); // grant only covers SITE_A
+    const res = grants.authorize({ profile: "pagecheck", method: "PUT", path: `pages/${PAGE_A}` });
+    assert.equal(res.ok, false);
+    assert.match(res.error, /different site/);
+    assert.match(res.hint, new RegExp(`--sites ${SITE_A},${SITE_B}`));
+  });
+
+  it("a scope-unrestricted read grant still needs the page cached (fail-closed applies regardless of tier)", () => {
+    profiles.setToken("pagecheck", "tok_1234567890abcdefghij", { preferFile: true });
+    grants.issueGrant({ profile: "pagecheck", tier: "read", ttlMs: 60_000, siteIds: [SITE_A] });
+    const res = grants.authorize({ profile: "pagecheck", method: "GET", path: `pages/${PAGE_UNKNOWN}` });
+    assert.equal(res.ok, false);
+  });
+
+  it("does not confuse pages with the still-unresolved resource prefixes (assets, webhooks stay fail-closed with no cache)", () => {
+    profiles.setToken("pagecheck", "tok_1234567890abcdefghij", { preferFile: true });
+    profiles.cachePages("pagecheck", SITE_A, [{ id: PAGE_A }]);
+    grants.issueGrant({ profile: "pagecheck", tier: "write", ttlMs: 60_000, siteIds: [SITE_A] });
+    const page = grants.authorize({ profile: "pagecheck", method: "PUT", path: `pages/${PAGE_A}` });
+    assert.equal(page.ok, true);
+    const asset = grants.authorize({ profile: "pagecheck", method: "PUT", path: `assets/${PAGE_A}` });
+    assert.equal(asset.ok, false);
+    assert.match(asset.error, /cannot be verified/i);
   });
 });
 
