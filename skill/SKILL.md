@@ -150,6 +150,15 @@ Always pass `--site`, and read the result back after a change.
 Read [references/page-schema.md](references/page-schema.md) for the commands,
 file shapes, locale behaviour and limits.
 
+## Audit the CMS before a handover
+
+`wf cms audit <siteId>` measures how well the collections explain themselves to
+whoever fills them in: help-text coverage on author-facing fields, the
+collections with none at all, and the undocumented fields whose type cannot
+explain them. Read-only. The output is counts rather than a verdict — decide
+what they are worth from who edits the panel. See
+[cms-commands.md](references/cms-commands.md).
+
 ## Safer CMS editing
 
 Prefer `wf fields`, `wf fields add`, `wf fields update`, `wf items set` and `wf item publish` to

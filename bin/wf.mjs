@@ -39,6 +39,7 @@
 //   wf call items list-items --p collection_id=<id> --q limit=5
 //   wf call items create-item --p collection_id=<id> --data '{"fieldData":{…}}'
 //   wf collections <siteId> | collection <id> | items <colId> | pages <siteId> | publish <siteId>
+//   wf cms audit <siteId> [--json]                                help-text coverage across every collection (read-only)
 //   wf fields <collectionId> [--json]                             table, or complete field metadata as JSON
 //   wf fields add <collId> --type <Type> --name <Name> [--to <id>] [--options a,b,c]
 //   wf fields update <collId> <fieldId> [--name <Name>] [--help-text <text>] [--is-required true|false]
@@ -102,6 +103,7 @@ import {
 } from "../lib/assets.mjs";
 import { endpointForRequest, knownGroups, resolveCallEndpoint } from "../lib/catalog.mjs";
 import { listCollectionsFree, listPagesFree, listSitesFree, listSitesFreeAllProfiles, webflowRequest } from "../lib/client.mjs";
+import { auditCollections, renderCmsAudit } from "../lib/cms-audit.mjs";
 import { parseTtl, readJsonDetail } from "../lib/config.mjs";
 import { diagnose, formatDiagnosis, formatReference } from "../lib/doctor.mjs";
 import { ENDPOINTS } from "../lib/endpoints.mjs";
@@ -1158,6 +1160,35 @@ if (cmd === "fields" && !["add", "update"].includes(positionals[1])) {
   if (!collectionId) die("Usage: wf fields <collectionId>", "wf collections <siteId> to find a collection id first. `wf fields add …` creates a field.");
   const render = flagJson ? (data) => JSON.stringify(Array.isArray(data?.fields) ? data.fields : [], null, 2) : renderFieldsTable;
   await run({ method: "GET", path: `collections/${collectionId}` }, render);
+}
+
+// `wf cms audit <siteId>` — how well the CMS explains itself to whoever fills
+// it in. One GET for the collection list, then one per collection, because the
+// Data API returns fields inline on the collection rather than from a fields
+// endpoint. Read-only: it never writes, so it needs no write scope.
+//
+// It reports counts and never a verdict. Whether the coverage is enough depends
+// on who opens the panel and how often, which the CLI cannot know. The one
+// judgement it does make is the denominator — Webflow's own system fields
+// cannot carry help text, so including them would understate every site by the
+// same wrong amount.
+if (cmd === "cms" && positionals[1] === "audit") {
+  const siteId = positionals[2];
+  if (!siteId) die("Usage: wf cms audit <siteId> [--json]", "wf sites lists the site ids you have been granted.");
+  const list = await request({ method: "GET", path: `sites/${siteId}/collections` });
+  if (!list.ok) out(list, { path: `sites/${siteId}/collections`, method: "GET" });
+  const summaries = Array.isArray(list.data?.collections) ? list.data.collections : [];
+  const collections = [];
+  for (const summary of summaries) {
+    const id = String(summary?.id || "");
+    if (!id) continue;
+    const full = await request({ method: "GET", path: `collections/${id}` });
+    if (!full.ok) out(full, { path: `collections/${id}`, method: "GET" });
+    collections.push(full.data);
+  }
+  const report = auditCollections(collections);
+  console.log(flagJson ? JSON.stringify(report, null, 2) : renderCmsAudit(report));
+  process.exit(0);
 }
 
 // `wf fields add <collectionId> --type <Type> --name <DisplayName> […]` —

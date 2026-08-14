@@ -36,31 +36,33 @@ A field named `Show if`, `Sort order` or `Hide on listing` is unusable without
 one, so coverage is worth measuring before a handover rather than after the first
 support question.
 
-Read every collection, then every collection's fields as JSON, and count:
-
 ```bash
-wf collections <siteId>
-wf fields <collectionId> --json
+wf cms audit <siteId>
+wf cms audit <siteId> --json
 ```
 
-Two rules make the number mean something:
+Read-only: it reads the collection list and each collection, and writes nothing.
 
-- **Count author-facing fields only.** Webflow's own system fields — `Name`,
-  `Slug`, `Archived`, `Draft`, `Created On`, `Updated On`, `Published On`,
-  `Created By`, `Updated By`, `Published By` — cannot carry help text. Leaving
-  them in the denominator understates every site by roughly the same wrong
-  amount: one real collection set measured 24% against all fields and 54%
-  against the fields an author can annotate.
-- **Weight by whether the value explains itself.** A plain-text field called
-  `Headline` needs no help text. A reference, an option, a switch or a bare
-  number cannot be understood from its value alone, so an undocumented one of
-  those is a genuine gap while an undocumented headline is not.
+The command already applies the two rules that make the number mean anything, so
+do not re-derive them:
 
-Report the collections with no help text at all separately: a collection where
-nobody has written any is a different problem from one that is merely patchy.
+- **Author-facing fields only.** Webflow's system fields cannot carry help text,
+  and counting them understates every site by roughly the same wrong amount —
+  one real collection set measured 24% against all fields and 54% against the
+  fields an author can annotate.
+- **Opaque fields called out by name.** An undocumented `Headline` is fine
+  because an author reads the value. An undocumented switch, reference, option,
+  number, date, link or file is a real gap, so those are listed individually
+  rather than folded into a percentage.
 
-Write the results back with `wf fields update --file`, one collection per batch,
-so each change is proved by a fresh readback.
+Collections with no help text at all are reported separately from patchy ones,
+and a collection with no author-facing fields shows `n/a` rather than 0%.
+
+**The output is counts, not a verdict.** Whether the coverage is enough depends
+on who opens that panel and how often — a client editing weekly and a builder who
+never returns need different answers, and the CLI cannot know which this is.
+Judge it, then write improvements back with `wf fields update --file`, one
+collection per batch, so each change is proved by a fresh readback.
 
 ## Update field metadata
 
