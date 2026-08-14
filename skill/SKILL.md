@@ -3,8 +3,9 @@ name: wf-cli
 description: >-
   Use the `wf` CLI to read or change Webflow CMS data and site settings. Use for
   collections, fields, items, pages, SEO data, assets, forms, redirects,
-  localisation or publishing through the Webflow Data API. The command only
-  works after a person grants access to the named site.
+  localisation, CMS item publishing, or site-publication preparation through the
+  Webflow Data API. The command only works after a person grants access to the
+  named site.
 ---
 
 # Webflow Data API CLI
@@ -194,7 +195,9 @@ fits, which live limits to check and the rules for safe item changes.
 
 ## Final safety checks
 
-- Never publish a site (no `sites/publish`).
+- Never publish a site (`sites/publish`). CMS item publication remains a danger
+  operation: preview it, confirm the exact item target, run it only under a
+  human-issued danger grant, then read the item state back.
 - Never delete CMS items without explicit user confirmation.
 - Never reset or manage webhooks or site scripts.
 - Do not use the Data API to change elements in the Webflow Designer. Use the
