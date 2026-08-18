@@ -1,23 +1,30 @@
-# Simple profile
+# Simple
 
 ## Reality
 
-- Users: Tim and authorised agents operating the Webflow Data API through a deny-by-default CLI.
-- Operators: a human stores profiles and issues time-boxed read, write or danger grants.
-- External consumers: shell users and the installed `wf` skill; live Webflow sites and CMS data are the remote system.
-- Public contracts: CLI commands, profile store, grant semantics, call budgets, audit behaviour and structured output.
-- Persistent production data: credentials in local Keychain/profile storage and live Webflow data; neither belongs in Git.
-- Compatibility obligations: preserve human-only grants, authority tiers, budget enforcement and public disclosure boundaries.
-- Current scale and failure consequences: full Webflow Data API access; a safety regression can alter or delete live client content.
+- User/operator: Tim. Current tokens, grants, live sites, and external users are not inferred.
+- External surface: Public-source-intended but currently private Node CLI/skill for Webflow Data API v2 with time-boxed human grants, local profiles, audit logs, and disclosure checks.
+- Persistent data: Local profile/grant/audit state and any authorised remote Webflow data; no client data belongs in Git.
+- Compatibility: Preserve command/grant behaviour used by Tim and the companion skill; no published package contract is proven.
 
-## Architecture boundary
+## Preserve
 
-`wf` alone owns Data API operations. Sideman owns Designer control. This CLI is not a credential broker for agents, a publishing automation layer or a Webflow project database.
+- Deny-by-default network access, human-only grants, scope/tier/call budgets, destructive/publish confirmation, site pinning, audit logging, and no private/client disclosure.
 
-## Deletion proof
+## Current boundary
 
-- Dead code: trace every command through parser, grant policy, API adapter, tests and the installed skill.
-- Types or compiler: Node parsing plus `npm run lint`.
-- Behaviour: `npm test`; never use live mutation as a deletion probe.
-- Build: `npm run prepublishOnly` and `npm run check-disclosure`.
-- Public surface: verify help text, grant refusal paths, audit records and skill routing.
+- Data API requests and safeguards. It does not own Designer control, agent credential brokering, client project state, or unattended publishing.
+
+## Ordinary paths
+
+- Carry commands through parser, grant policy, endpoint/client, audit, tests, and companion skill. Refusal paths are part of the product.
+
+## Proof
+
+- `npm test`
+- `npm run check-disclosure`
+- `wf status`, `wf doctor`, and `--dry` validation. Never use live mutation as a test.
+
+## Reconsider when
+
+- An approved workflow cannot fit existing grants while retaining equivalent human approval, scope, budget, and audit evidence.
