@@ -1,0 +1,4 @@
+interface:
+  display_name: "Webflow Data API"
+  short_description: "Use the grant-gated Webflow Data API CLI"
+  default_prompt: "Use $wf to inspect or change Webflow Data API resources through the grant-gated CLI."
