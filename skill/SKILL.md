@@ -3,8 +3,9 @@ name: wf-cli
 description: >-
   Use the `wf` CLI to read or change Webflow CMS data and site settings. Use for
   collections, fields, items, pages, SEO data, assets, forms, redirects,
-  localisation, CMS item publishing, or site-publication preparation through the
-  Webflow Data API. The command only works after a person grants access to the
+  localisation, CMS item publishing, auditing internal links left inside CMS
+  content by a migration, or site-publication preparation through the Webflow
+  Data API. The command only works after a person grants access to the
   named site.
 ---
 
@@ -105,6 +106,7 @@ result. A successful HTTP response alone is not completion.
     wf fields update <collId> <fieldId> --name "Editorial summary" --is-required false
     wf items set <collId> <itemId> --set slug=value    # typed CMS item write
     wf item publish <collId> <itemId…>             # bulk publish
+    wf links audit <siteId> --hosts a.com,www.a.com [--canonical www.a.com]   # same-site link hygiene
     wf audit report                # what happened lately
     wf assets upload <file...> --site <id> [--dir <path>] [--folder <name>] --dry
 
@@ -159,6 +161,29 @@ collections with none at all, and the undocumented fields whose type cannot
 explain them. Read-only. The output is counts rather than a verdict — decide
 what they are worth from who edits the panel. See
 [cms-commands.md](references/cms-commands.md).
+
+## Check internal links after a migration
+
+`wf links audit <siteId> --hosts a.com,www.a.com` finds links inside CMS
+rich-text and link fields that point at this site but are written as absolute
+URLs, carry a trailing slash, or use a host other than the canonical one. Each
+still works, so nothing looks broken, but the host corrects it with a redirect
+on every visit.
+
+`--hosts` is required and names every domain that counts as this site, including
+the one the content was migrated from. `--canonical www.a.com` names the single
+host links should use; without it, host variants are not judged. Add
+`--check-targets` to report what each destination returns.
+
+`--related-hosts shop.a.com` names other sites — an old shop, a sister brand —
+that should appear in the audit but never be rewritten, and keeps them out of the
+headline count.
+
+Read-only, and deliberately narrow: it reports what each link is and never
+infers where one ought to point instead.
+
+Read [links.md](references/links.md) for the options, what counts as internal,
+and what the command deliberately leaves alone.
 
 ## Safer CMS editing
 

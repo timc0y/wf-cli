@@ -40,6 +40,11 @@
 //   wf call items create-item --p collection_id=<id> --data '{"fieldData":{…}}'
 //   wf collections <siteId> | collection <id> | items <colId> | pages <siteId> | publish <siteId>
 //   wf cms audit <siteId> [--json]                                help-text coverage across every collection (read-only)
+//   wf links audit <siteId> --hosts a.com,www.a.com [--canonical www.a.com] [--related-hosts shop.a.com] [--collections a,b] [--check-targets] [--json]
+//     (same-site links in CMS rich-text and link fields that are absolute,
+//      trailing-slashed, or off the canonical host. --check-targets reports each
+//      destination's status. Read-only: it never rewrites and never infers
+//      where a link should point instead.)
 //   wf fields <collectionId> [--json]                             table, or complete field metadata as JSON
 //   wf fields add <collId> --type <Type> --name <Name> [--to <id>] [--options a,b,c]
 //   wf fields update <collId> <fieldId> [--name <Name>] [--help-text <text>] [--is-required true|false]
@@ -110,6 +115,7 @@ import { ENDPOINTS } from "../lib/endpoints.mjs";
 import { CODES } from "../lib/error-codes.mjs";
 import { buildFieldUpdateBatch, buildFieldUpdateBody, preflightFieldUpdateBatch, verifyFieldUpdate, verifyFieldUpdateBatch } from "../lib/fields.mjs";
 import { MS_PER_DAY, describeGrant, getGrant, isFailure, issueGrant, listGrants, readAudit, revokeAll, revokeGrant } from "../lib/grants.mjs";
+import { LINK_FIELD_TYPES, applyTargetStatus, auditLinks, listAllItems, normalizeHosts, renderLinkAudit, resolveTargets } from "../lib/links.mjs";
 import { offloadIfLarge } from "../lib/offload.mjs";
 import {
   cacheCollections,
@@ -180,7 +186,12 @@ const {
   flagRequired,
   flagIsRequired,
   flagHelpText,
-  flagSlug
+  flagSlug,
+  flagCollections,
+  flagHosts,
+  flagCanonical,
+  flagRelatedHosts,
+  flagCheckTargets
 } = parseCliArgs(process.argv.slice(2));
 
 if (liveClientAccess) {
@@ -1188,6 +1199,110 @@ if (cmd === "cms" && positionals[1] === "audit") {
   }
   const report = auditCollections(collections);
   console.log(flagJson ? JSON.stringify(report, null, 2) : renderCmsAudit(report));
+  process.exit(0);
+}
+
+// `wf links audit <siteId>` — internal links inside CMS content that are
+// absolute, carry a trailing slash, or use a host other than the canonical one.
+//
+// These are the links a migration leaves behind. Each one works, so nothing
+// looks broken, but every visit to one is routed through the host's own
+// normalisation redirects before it reaches the page. A root-relative link has
+// nothing to correct.
+//
+// --hosts is required and has no fallback. The site record would only ever know
+// the domains the site answers on TODAY, and the links that matter most are the
+// ones still pointing at the domain it was migrated FROM. Naming the set in the
+// command is also the only way a reader can tell what was treated as internal.
+//
+// --canonical names the one host this site should be linked to. Whether that is
+// the bare domain or the www one is a per-site decision that reverses freely, so
+// it is never assumed; without it, host variants simply are not judged.
+//
+// Read-only by construction. It reports what each link IS and never where it
+// ought to point instead: repointing a link is editorial judgement, and this
+// command has no way to make it.
+if (cmd === "links" && positionals[1] === "audit") {
+  const siteId = positionals[2];
+  const usage =
+    "Usage: wf links audit <siteId> --hosts a.com,www.a.com [--canonical www.a.com] [--related-hosts shop.a.com] [--collections a,b] [--check-targets] [--json]";
+  if (!siteId) die(usage, "wf sites lists the site ids you have been granted.");
+
+  if (!flagHosts?.length)
+    die(
+      "--hosts is required: name every domain that counts as this site, including any the content was migrated from.",
+      `wf links audit ${siteId} --hosts example.com,www.example.com,old-domain.example`
+    );
+
+  const canonical = flagCanonical ? [...normalizeHosts([flagCanonical])][0] || null : null;
+  // The canonical host is part of this site by definition, so it joins the set
+  // rather than having to be repeated in --hosts.
+  const hosts = normalizeHosts([...flagHosts, ...(canonical ? [canonical] : [])]);
+  if (!hosts.size) die("--hosts produced no usable hostnames.", usage);
+
+  // Related hosts are other sites that share a domain. They are reported so an
+  // audit is complete, and never rewritten, because removing their host would
+  // point the link at this site instead. A host named in both is this site.
+  const relatedHosts = normalizeHosts(flagRelatedHosts);
+  const overlap = [...relatedHosts].filter((host) => hosts.has(host));
+  if (overlap.length)
+    die(
+      `${overlap.join(", ")} appears in both --hosts and --related-hosts, so it cannot be both this site and another one.`,
+      "Remove it from whichever it does not belong to."
+    );
+
+  const list = await request({ method: "GET", path: `sites/${siteId}/collections` });
+  if (!list.ok) out(list, { path: `sites/${siteId}/collections`, method: "GET" });
+
+  const wanted = flagCollections?.length ? new Set(flagCollections.map((value) => value.toLowerCase())) : null;
+  const summaries = (Array.isArray(list.data?.collections) ? list.data.collections : []).filter(
+    (summary) => !wanted || wanted.has(String(summary?.slug || "").toLowerCase()) || wanted.has(String(summary?.id || "").toLowerCase())
+  );
+  if (wanted && !summaries.length)
+    die(`No collection matched --collections ${flagCollections.join(",")}.`, `wf collections ${siteId} lists the slugs and ids on this site.`);
+
+  const collections = [];
+  for (const summary of summaries) {
+    const id = String(summary?.id || "");
+    if (!id) continue;
+
+    const full = await request({ method: "GET", path: `collections/${id}` });
+    if (!full.ok) out(full, { path: `collections/${id}`, method: "GET" });
+
+    // Only fetch items for a collection that has somewhere to put a link.
+    // Skipping the rest keeps the call count proportional to the work.
+    const fields = Array.isArray(full.data?.fields) ? full.data.fields : [];
+    if (!fields.some((field) => LINK_FIELD_TYPES.has(String(field?.type || "")))) {
+      collections.push({ ...full.data, items: [] });
+      continue;
+    }
+
+    // Page to the end. A partial read would understate the count, and an
+    // understated count reads exactly like a clean result.
+    const paged = await listAllItems({ requestFn: request, collectionId: id });
+    if (!paged.ok) out(paged.page, { path: `collections/${id}/items`, method: "GET" });
+    collections.push({ ...full.data, items: paged.items });
+  }
+
+  const report = auditLinks({ collections, hosts, canonical, relatedHosts });
+
+  // --check-targets asks the live site for each destination's status. It
+  // separates "written badly" from "broken": a 404 is a dead link in published
+  // content regardless of how the link is written. It reports the status and
+  // any Location header as facts, and never follows a redirect to decide where
+  // a link ought to point instead. Opt-in, because it talks to the public site
+  // rather than the Data API, and an unpublished site has nothing to answer.
+  let linkReport = report;
+  if (flagCheckTargets && report.targets.length) {
+    // The canonical host is the right thing to probe when it is known: probing
+    // a variant that merely redirects would mark every destination a 301.
+    const origin = canonical || [...hosts].find((host) => !host.endsWith(".webflow.io")) || [...hosts][0];
+    if (!flagJson) console.error(`… resolving ${report.targets.length} destination(s) against https://${origin}`);
+    const statusByTarget = await resolveTargets({ targets: report.targets, origin, fetchImpl: globalThis.fetch });
+    linkReport = applyTargetStatus(report, statusByTarget);
+  }
+
+  console.log(flagJson ? JSON.stringify(linkReport, null, 2) : renderLinkAudit(linkReport));
   process.exit(0);
 }
 
