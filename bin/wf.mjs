@@ -39,8 +39,16 @@
 //   wf call items list-items --p collection_id=<id> --q limit=5
 //   wf call items create-item --p collection_id=<id> --data '{"fieldData":{…}}'
 //   wf collections <siteId> | collection <id> | items <colId> | pages <siteId> | publish <siteId>
-//   wf fields <collectionId>                                      field table: slug | type | required | displayName
+//   wf cms audit <siteId> [--json]                                help-text coverage across every collection (read-only)
+//   wf links audit <siteId> --hosts a.com,www.a.com [--canonical www.a.com] [--related-hosts shop.a.com] [--collections a,b] [--check-targets] [--json]
+//     (same-site links in CMS rich-text and link fields that are absolute,
+//      trailing-slashed, or off the canonical host. --check-targets reports each
+//      destination's status. Read-only: it never rewrites and never infers
+//      where a link should point instead.)
+//   wf fields <collectionId> [--json]                             table, or complete field metadata as JSON
 //   wf fields add <collId> --type <Type> --name <Name> [--to <id>] [--options a,b,c]
+//   wf fields update <collId> <fieldId> [--name <Name>] [--help-text <text>] [--is-required true|false]
+//   wf fields update <collId> --file field-updates.json           one collection, one final server readback
 //   wf items set <collId> <itemId> --set slug=value […] [--draft true|false] [--archived true|false] [--live]
 //   wf item publish <collId> <itemId…>                            bulk publish (danger; --confirm the id set)
 //   wf page-schema <pageId…> --site <siteId> [--locale <id>]      JSON-LD schema markup (beta)
@@ -53,11 +61,14 @@
 //   --dry on any invoke prints the exact request without sending.
 //   DELETE / publish / webhook creation also require --confirm <target-id>.
 //   NOTE: collection/item/field paths address a collection id, not a site id,
-//   so they can't be checked against a grant's site from the URL alone. `wf
-//   grant` auto-refreshes a collection->site cache for the granted site(s)
-//   (also `wf collections refresh --sites <ids>` standalone) so these calls
-//   CAN be verified; an uncached collection fails closed, same as any other
-//   site mismatch.
+//   and single-page paths (pages/{page_id}, e.g. get-metadata,
+//   update-page-settings) address a page id, not a site id — neither can be
+//   checked against a grant's site from the URL alone. `wf grant`
+//   auto-refreshes a collection->site AND a page->site cache for the granted
+//   site(s) (also `wf collections refresh --sites <ids>` and `wf pages
+//   refresh --sites <ids>` standalone) so these calls CAN be verified; an
+//   uncached collection or page fails closed, same as any other site
+//   mismatch.
 //
 // GRANTS (human-only; run these yourself, agents will ask you to):
 //   wf grant acme --sites acme-marketing --ttl 8h                 read-only for the day
@@ -67,6 +78,7 @@
 //      from the last `wf sites` — or the raw 24-hex id; scope = endpoint
 //      groups from `wf ls`; budgets default 100 write/20 danger)
 //   wf collections refresh --sites <ids>    refresh the collection->site cache (free, no grant)
+//   wf pages refresh --sites <ids>          refresh the page->site cache (free, no grant)
 //   wf grants | wf revoke acme | wf revoke --all
 //   wf audit report [--days 7]             what actually happened, with durations + errors
 //   wf audit fails [--days 7]              only the failing calls, full error + body detail
@@ -95,15 +107,19 @@ import {
   uploadAssetFile
 } from "../lib/assets.mjs";
 import { endpointForRequest, knownGroups, resolveCallEndpoint } from "../lib/catalog.mjs";
-import { listCollectionsFree, listSitesFree, listSitesFreeAllProfiles, webflowRequest } from "../lib/client.mjs";
+import { listCollectionsFree, listPagesFree, listSitesFree, listSitesFreeAllProfiles, webflowRequest } from "../lib/client.mjs";
+import { auditCollections, renderCmsAudit } from "../lib/cms-audit.mjs";
 import { parseTtl, readJsonDetail } from "../lib/config.mjs";
 import { diagnose, formatDiagnosis, formatReference } from "../lib/doctor.mjs";
 import { ENDPOINTS } from "../lib/endpoints.mjs";
 import { CODES } from "../lib/error-codes.mjs";
+import { buildFieldUpdateBatch, buildFieldUpdateBody, preflightFieldUpdateBatch, verifyFieldUpdate, verifyFieldUpdateBatch } from "../lib/fields.mjs";
 import { MS_PER_DAY, describeGrant, getGrant, isFailure, issueGrant, listGrants, readAudit, revokeAll, revokeGrant } from "../lib/grants.mjs";
+import { LINK_FIELD_TYPES, applyTargetStatus, auditLinks, listAllItems, normalizeHosts, renderLinkAudit, resolveTargets } from "../lib/links.mjs";
 import { offloadIfLarge } from "../lib/offload.mjs";
 import {
   cacheCollections,
+  cachePages,
   cacheSites,
   getCachedSites,
   listProfiles,
@@ -168,8 +184,14 @@ const {
   flagTo,
   flagOptions,
   flagRequired,
+  flagIsRequired,
   flagHelpText,
-  flagSlug
+  flagSlug,
+  flagCollections,
+  flagHosts,
+  flagCanonical,
+  flagRelatedHosts,
+  flagCheckTargets
 } = parseCliArgs(process.argv.slice(2));
 
 if (liveClientAccess) {
@@ -511,6 +533,21 @@ if (cmd === "grant") {
     }
   }
 
+  // Same best-effort refresh, same reason, for the page -> site cache: pages
+  // endpoints addressed by bare page_id carry no site id in the URL either,
+  // so a fresh grant with no cached pages yet would fail closed on the very
+  // next `pages get-metadata` / `update-page-settings` call.
+  for (const p of profiles) {
+    for (const siteId of siteIds) {
+      const res = await listPagesFree(p, siteId);
+      if (res.ok) cachePages(p, siteId, res.pages);
+      else
+        console.error(
+          `(could not refresh page cache for site ${siteId}: ${res.error} — pages calls for it may fail closed until \`wf pages refresh\` succeeds)`
+        );
+    }
+  }
+
   if (tier !== "read") {
     const p = profiles[0];
     console.log(
@@ -648,7 +685,7 @@ const validateOrDie = ({ method, path, body }) => {
   return { endpoint, checked };
 };
 
-const run = async ({ method, path, query: q2, body }, render = null) => {
+const request = async ({ method, path, query: q2, body }) => {
   // webflowRequest (below) now enforces this same pin itself — see
   // lib/client.mjs — so this is no longer the only thing standing between a
   // wrong-client path and the network. It stays here anyway: checkSitePin is
@@ -680,7 +717,11 @@ const run = async ({ method, path, query: q2, body }, render = null) => {
     process.exit(0);
   }
 
-  out(await webflowRequest({ profile, method, path, query: q2, body, dryRun, confirm: flagConfirm, project }), { path, method }, render);
+  return webflowRequest({ profile, method, path, query: q2, body, dryRun, confirm: flagConfirm, project });
+};
+
+const run = async ({ method, path, query: q2, body }, render = null) => {
+  out(await request({ method, path, query: q2, body }), { path, method }, render);
 };
 
 const bodyFromFlags = () => {
@@ -1077,28 +1118,192 @@ if (cmd === "collections" && positionals[1] === "refresh") {
   process.exit(failed ? 1 : 0);
 }
 
-// `wf fields <collectionId>` — a collection's field list as a table (slug |
+// `wf pages refresh --sites <name-or-id>[,…]` — free (no grant), refills the
+// page -> site cache grants.mjs's site-scoping check relies on for
+// pages/{page_id} paths (see the comment there). Same shape as `wf
+// collections refresh` above, for the same reason: doesn't shadow the
+// existing `wf pages <siteId>` shortcut — only fires when the second
+// positional is literally "refresh".
+if (cmd === "pages" && positionals[1] === "refresh") {
+  if (!flagSites) die("Usage: wf pages refresh --sites <name-or-id>[,…] [--profile p]");
+  if (!profile) die("No profile resolved. Pass --profile <name>.");
+  const resolved = resolveSiteIds(profile, flagSites);
+  if (!resolved.ok)
+    die(
+      `Could not resolve "${resolved.unresolved}" to a site id for profile "${profile}".`,
+      "Run `wf sites` (free, no grant needed) first, or pass the 24-hex id directly."
+    );
+  const ids = resolved.ids;
+  let failed = 0;
+  for (const id of ids) {
+    const res = await listPagesFree(profile, id);
+    if (res.ok) {
+      cachePages(profile, id, res.pages);
+      console.log(`✓ ${id}: cached ${res.pages.length} page(s)`);
+    } else {
+      failed++;
+      console.error(`✗ ${id}: ${res.error}`);
+    }
+  }
+  process.exit(failed ? 1 : 0);
+}
+
+// `wf fields <collectionId>` — a collection's field list as a table (id | slug |
 // type | required | displayName), the way `wf sites` prints a table instead
 // of the raw JSON. There is no dedicated "list fields" endpoint — Webflow
 // returns a collection's fields inline on GET /collections/{collection_id}
 // (the existing `collections/get` entry in lib/endpoints.mjs), so this reuses
-// it rather than inventing a new one. Raw JSON stays reachable via
-// `wf call collections get --p collection_id=<id>` or `wf get collections/<id>`.
+// it rather than inventing a new one. `--json` prints only the fields so an
+// agent can build a metadata manifest without extracting a raw collection.
 const renderFieldsTable = (data) => {
   const fields = Array.isArray(data?.fields) ? data.fields : [];
   if (!fields.length) return "(collection has no fields)";
   const rows = [
-    ["slug", "type", "required", "displayName"],
-    ...fields.map((f) => [f.slug ?? "", f.type ?? "", f.isRequired ? "yes" : "no", f.displayName ?? ""])
+    ["id", "slug", "type", "required", "displayName"],
+    ...fields.map((f) => [f.id ?? "", f.slug ?? "", f.type ?? "", f.isRequired ? "yes" : "no", f.displayName ?? ""])
   ];
   const widths = rows[0].map((_, col) => Math.max(...rows.map((row) => String(row[col]).length)));
   return rows.map((row) => row.map((cell, col) => String(cell).padEnd(widths[col])).join("  ")).join("\n");
 };
 
-if (cmd === "fields" && positionals[1] !== "add") {
+if (cmd === "fields" && !["add", "update"].includes(positionals[1])) {
   const collectionId = positionals[1];
   if (!collectionId) die("Usage: wf fields <collectionId>", "wf collections <siteId> to find a collection id first. `wf fields add …` creates a field.");
-  await run({ method: "GET", path: `collections/${collectionId}` }, renderFieldsTable);
+  const render = flagJson ? (data) => JSON.stringify(Array.isArray(data?.fields) ? data.fields : [], null, 2) : renderFieldsTable;
+  await run({ method: "GET", path: `collections/${collectionId}` }, render);
+}
+
+// `wf cms audit <siteId>` — how well the CMS explains itself to whoever fills
+// it in. One GET for the collection list, then one per collection, because the
+// Data API returns fields inline on the collection rather than from a fields
+// endpoint. Read-only: it never writes, so it needs no write scope.
+//
+// It reports counts and never a verdict. Whether the coverage is enough depends
+// on who opens the panel and how often, which the CLI cannot know. The one
+// judgement it does make is the denominator — Webflow's own system fields
+// cannot carry help text, so including them would understate every site by the
+// same wrong amount.
+if (cmd === "cms" && positionals[1] === "audit") {
+  const siteId = positionals[2];
+  if (!siteId) die("Usage: wf cms audit <siteId> [--json]", "wf sites lists the site ids you have been granted.");
+  const list = await request({ method: "GET", path: `sites/${siteId}/collections` });
+  if (!list.ok) out(list, { path: `sites/${siteId}/collections`, method: "GET" });
+  const summaries = Array.isArray(list.data?.collections) ? list.data.collections : [];
+  const collections = [];
+  for (const summary of summaries) {
+    const id = String(summary?.id || "");
+    if (!id) continue;
+    const full = await request({ method: "GET", path: `collections/${id}` });
+    if (!full.ok) out(full, { path: `collections/${id}`, method: "GET" });
+    collections.push(full.data);
+  }
+  const report = auditCollections(collections);
+  console.log(flagJson ? JSON.stringify(report, null, 2) : renderCmsAudit(report));
+  process.exit(0);
+}
+
+// `wf links audit <siteId>` — internal links inside CMS content that are
+// absolute, carry a trailing slash, or use a host other than the canonical one.
+//
+// These are the links a migration leaves behind. Each one works, so nothing
+// looks broken, but every visit to one is routed through the host's own
+// normalisation redirects before it reaches the page. A root-relative link has
+// nothing to correct.
+//
+// --hosts is required and has no fallback. The site record would only ever know
+// the domains the site answers on TODAY, and the links that matter most are the
+// ones still pointing at the domain it was migrated FROM. Naming the set in the
+// command is also the only way a reader can tell what was treated as internal.
+//
+// --canonical names the one host this site should be linked to. Whether that is
+// the bare domain or the www one is a per-site decision that reverses freely, so
+// it is never assumed; without it, host variants simply are not judged.
+//
+// Read-only by construction. It reports what each link IS and never where it
+// ought to point instead: repointing a link is editorial judgement, and this
+// command has no way to make it.
+if (cmd === "links" && positionals[1] === "audit") {
+  const siteId = positionals[2];
+  const usage =
+    "Usage: wf links audit <siteId> --hosts a.com,www.a.com [--canonical www.a.com] [--related-hosts shop.a.com] [--collections a,b] [--check-targets] [--json]";
+  if (!siteId) die(usage, "wf sites lists the site ids you have been granted.");
+
+  if (!flagHosts?.length)
+    die(
+      "--hosts is required: name every domain that counts as this site, including any the content was migrated from.",
+      `wf links audit ${siteId} --hosts example.com,www.example.com,old-domain.example`
+    );
+
+  const canonical = flagCanonical ? [...normalizeHosts([flagCanonical])][0] || null : null;
+  // The canonical host is part of this site by definition, so it joins the set
+  // rather than having to be repeated in --hosts.
+  const hosts = normalizeHosts([...flagHosts, ...(canonical ? [canonical] : [])]);
+  if (!hosts.size) die("--hosts produced no usable hostnames.", usage);
+
+  // Related hosts are other sites that share a domain. They are reported so an
+  // audit is complete, and never rewritten, because removing their host would
+  // point the link at this site instead. A host named in both is this site.
+  const relatedHosts = normalizeHosts(flagRelatedHosts);
+  const overlap = [...relatedHosts].filter((host) => hosts.has(host));
+  if (overlap.length)
+    die(
+      `${overlap.join(", ")} appears in both --hosts and --related-hosts, so it cannot be both this site and another one.`,
+      "Remove it from whichever it does not belong to."
+    );
+
+  const list = await request({ method: "GET", path: `sites/${siteId}/collections` });
+  if (!list.ok) out(list, { path: `sites/${siteId}/collections`, method: "GET" });
+
+  const wanted = flagCollections?.length ? new Set(flagCollections.map((value) => value.toLowerCase())) : null;
+  const summaries = (Array.isArray(list.data?.collections) ? list.data.collections : []).filter(
+    (summary) => !wanted || wanted.has(String(summary?.slug || "").toLowerCase()) || wanted.has(String(summary?.id || "").toLowerCase())
+  );
+  if (wanted && !summaries.length)
+    die(`No collection matched --collections ${flagCollections.join(",")}.`, `wf collections ${siteId} lists the slugs and ids on this site.`);
+
+  const collections = [];
+  for (const summary of summaries) {
+    const id = String(summary?.id || "");
+    if (!id) continue;
+
+    const full = await request({ method: "GET", path: `collections/${id}` });
+    if (!full.ok) out(full, { path: `collections/${id}`, method: "GET" });
+
+    // Only fetch items for a collection that has somewhere to put a link.
+    // Skipping the rest keeps the call count proportional to the work.
+    const fields = Array.isArray(full.data?.fields) ? full.data.fields : [];
+    if (!fields.some((field) => LINK_FIELD_TYPES.has(String(field?.type || "")))) {
+      collections.push({ ...full.data, items: [] });
+      continue;
+    }
+
+    // Page to the end. A partial read would understate the count, and an
+    // understated count reads exactly like a clean result.
+    const paged = await listAllItems({ requestFn: request, collectionId: id });
+    if (!paged.ok) out(paged.page, { path: `collections/${id}/items`, method: "GET" });
+    collections.push({ ...full.data, items: paged.items });
+  }
+
+  const report = auditLinks({ collections, hosts, canonical, relatedHosts });
+
+  // --check-targets asks the live site for each destination's status. It
+  // separates "written badly" from "broken": a 404 is a dead link in published
+  // content regardless of how the link is written. It reports the status and
+  // any Location header as facts, and never follows a redirect to decide where
+  // a link ought to point instead. Opt-in, because it talks to the public site
+  // rather than the Data API, and an unpublished site has nothing to answer.
+  let linkReport = report;
+  if (flagCheckTargets && report.targets.length) {
+    // The canonical host is the right thing to probe when it is known: probing
+    // a variant that merely redirects would mark every destination a 301.
+    const origin = canonical || [...hosts].find((host) => !host.endsWith(".webflow.io")) || [...hosts][0];
+    if (!flagJson) console.error(`… resolving ${report.targets.length} destination(s) against https://${origin}`);
+    const statusByTarget = await resolveTargets({ targets: report.targets, origin, fetchImpl: globalThis.fetch });
+    linkReport = applyTargetStatus(report, statusByTarget);
+  }
+
+  console.log(flagJson ? JSON.stringify(linkReport, null, 2) : renderLinkAudit(linkReport));
+  process.exit(0);
 }
 
 // `wf fields add <collectionId> --type <Type> --name <DisplayName> […]` —
@@ -1148,6 +1353,154 @@ if (cmd === "fields" && positionals[1] === "add") {
     ...(Object.keys(metadata).length ? { metadata } : {})
   };
   await run({ method: "POST", path: `collections/${collectionId}/fields`, body });
+}
+
+// `wf fields update <collectionId> <fieldId>` owns the documented scalar
+// metadata fields. Group membership and order have no Data API representation;
+// those stay in the Designer layer. A PATCH acknowledgement is intentionally
+// not success here: fetch the parent collection again and prove the exact
+// field contains every requested value before reporting completion.
+if (cmd === "fields" && positionals[1] === "update") {
+  const collectionId = positionals[2];
+  const fieldId = positionals[3];
+  if (!collectionId)
+    die(
+      "Usage: wf fields update <collectionId> <fieldId> [--name <DisplayName>] [--help-text <text>] [--is-required true|false] | wf fields update <collectionId> --file updates.json",
+      "wf fields <collectionId> lists the field ids and current metadata."
+    );
+  if (file) {
+    if (fieldId) die("Use either <fieldId> flags or --file updates.json, not both.");
+    let parsed;
+    try {
+      parsed = JSON.parse(readFileSync(resolve(process.cwd(), file), "utf8"));
+    } catch (error) {
+      die(`Could not read field update file "${file}": ${error.message}`);
+    }
+    const batch = buildFieldUpdateBatch(parsed);
+    if (!batch.ok) die(batch.error);
+    const paths = batch.updates.map(({ fieldId: id }) => `collections/${collectionId}/fields/${id}`);
+    if (flagCheck) {
+      for (const [index, update] of batch.updates.entries()) validateOrDie({ method: "PATCH", path: paths[index], body: update.body });
+      console.log(`✓ --check: ${batch.updates.length} field update(s) match the documented PATCH contract. Nothing was sent.`);
+      process.exit(0);
+    }
+    if (!dryRun) {
+      const preflightPath = `collections/${collectionId}`;
+      const current = await request({ method: "GET", path: preflightPath });
+      if (!current.ok) out(current, { path: preflightPath, method: "GET" });
+      const preflight = preflightFieldUpdateBatch({ collection: current.data, updates: batch.updates });
+      if (!preflight.ok) out({ ok: false, errorCode: CODES.WF_FIELD_BATCH_PREFLIGHT, error: preflight.error }, { path: preflightPath, method: "GET" });
+    }
+    const applied = [];
+    const previews = [];
+    for (const [index, update] of batch.updates.entries()) {
+      const written = await request({ method: "PATCH", path: paths[index], body: update.body });
+      if (!written.ok) {
+        const reread = await request({ method: "GET", path: `collections/${collectionId}` });
+        const partial = reread.ok ? verifyFieldUpdateBatch({ collection: reread.data, updates: applied }) : null;
+        out(
+          {
+            ...written,
+            error: `Batch stopped at field ${update.fieldId}: ${written.error || "PATCH failed"}`,
+            details: {
+              applied: applied.length,
+              verifiedApplied: partial?.ok === true,
+              verification: partial?.failures || null,
+              remaining: batch.updates.slice(index).map(({ fieldId: id }) => id)
+            }
+          },
+          { path: paths[index], method: "PATCH" }
+        );
+      }
+      if (written.dryRun) previews.push(written.data?.wouldSend);
+      else applied.push(update);
+    }
+    if (dryRun) {
+      console.log(JSON.stringify({ wouldSend: previews, note: `--dry: ${batch.updates.length} field PATCH request(s); nothing was sent.` }, null, 2));
+      process.exit(0);
+    }
+    const readbackPath = `collections/${collectionId}`;
+    const reread = await request({ method: "GET", path: readbackPath });
+    if (!reread.ok)
+      out(
+        {
+          ...reread,
+          errorCode: CODES.WF_WRITE_UNVERIFIED,
+          error: `Field batch completed but fresh collection readback failed: ${reread.error || "unknown read error"}`
+        },
+        { path: readbackPath, method: "GET" }
+      );
+    const verification = verifyFieldUpdateBatch({ collection: reread.data, updates: batch.updates });
+    if (!verification.ok)
+      out(
+        { ok: false, errorCode: CODES.WF_WRITE_UNVERIFIED, error: "The field batch did not fully persist.", details: verification.failures },
+        { path: readbackPath, method: "GET" }
+      );
+    out(
+      {
+        ok: true,
+        data: {
+          changed: batch.updates.map(({ fieldId: id, body }) => ({ fieldId: id, keys: Object.keys(body) })),
+          verification: { verified: true, collectionId, fieldIds: batch.updates.map(({ fieldId: id }) => id), source: "fresh_collection_readback" }
+        }
+      },
+      { path: readbackPath, method: "GET" }
+    );
+  }
+  if (!fieldId)
+    die(
+      "Usage: wf fields update <collectionId> <fieldId> [--name <DisplayName>] [--help-text <text>] [--is-required true|false] | wf fields update <collectionId> --file updates.json",
+      "wf fields <collectionId> lists the field ids and current metadata."
+    );
+  if (flagName != null && !flagName.trim()) die("--name cannot be empty.");
+  const isRequired = parseBoolFlag(flagIsRequired, "is-required");
+  const built = buildFieldUpdateBody({
+    ...(flagName != null ? { displayName: flagName } : {}),
+    ...(flagHelpText != null ? { helpText: flagHelpText } : {}),
+    ...(isRequired !== undefined ? { isRequired } : {})
+  });
+  if (!built.ok) die(built.error);
+
+  const path = `collections/${collectionId}/fields/${fieldId}`;
+  const written = await request({ method: "PATCH", path, body: built.body });
+  if (!written.ok || written.dryRun) out(written, { path, method: "PATCH" });
+
+  const readbackPath = `collections/${collectionId}`;
+  const reread = await request({ method: "GET", path: readbackPath });
+  if (!reread.ok) {
+    out(
+      {
+        ...reread,
+        errorCode: CODES.WF_WRITE_UNVERIFIED,
+        error: `Field PATCH completed but fresh collection readback failed: ${reread.error || "unknown read error"}`
+      },
+      { path: readbackPath, method: "GET" }
+    );
+  }
+  const verification = verifyFieldUpdate({ collection: reread.data, fieldId, expected: built.body });
+  if (!verification.ok)
+    out(
+      {
+        ok: false,
+        status: written.status,
+        errorCode: CODES.WF_WRITE_UNVERIFIED,
+        error: verification.error,
+        details: { expected: built.body, field: verification.field, mismatched: verification.mismatched || [] }
+      },
+      { path: readbackPath, method: "GET" }
+    );
+  out(
+    {
+      ok: true,
+      status: written.status,
+      data: {
+        field: verification.field,
+        changed: built.body,
+        verification: { verified: true, collectionId, fieldId, source: "fresh_collection_readback" }
+      }
+    },
+    { path, method: "PATCH" }
+  );
 }
 
 // `wf items set <collectionId> <itemId> --set slug=value […]` — typed CMS

@@ -35,3 +35,5 @@ npm test
 ```
 
 It is broader than `check-disclosure` alone.
+
+@AGENTS.md

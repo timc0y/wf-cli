@@ -30,8 +30,11 @@ if (!existsSync(TARGET)) {
 }
 
 for (const dir of HARNESSES) {
-  mkdirSync(dir, { recursive: true });
-  const link = join(dir, "wf");
+  if (!existsSync(dir)) {
+    act(`create harness directory ${dir}`, () => mkdirSync(dir, { recursive: true }));
+    if (check) continue;
+  }
+  const link = join(dir, "wf-cli");
 
   let current = null;
   try {

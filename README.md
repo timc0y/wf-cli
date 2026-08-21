@@ -82,4 +82,4 @@ The disclosure check (`scripts/check-disclosure.mjs`) validates that no private 
 
 ## Agents
 
-Agents use the `wf` skill (`skill/SKILL.md`). The core instruction is: run `wf help agents` and obey CLI error responses. Refusals state the exact command required from the human operator.
+Agents use the `wf-cli` skill (`skill/SKILL.md`); `wf` is the executable. The core instruction is: run `wf help agents` and obey CLI error responses. Refusals state the exact command required from the human operator.
