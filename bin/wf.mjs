@@ -41,6 +41,38 @@
 //   wf collections <siteId> | collection <id> | items <colId> | pages <siteId> | publish <siteId>
 //   wf cms audit <siteId> [--json]                                help-text coverage across every collection (read-only)
 //   wf links audit <siteId> --hosts a.com,www.a.com [--canonical www.a.com] [--related-hosts shop.a.com] [--collections a,b] [--check-targets] [--json]
+//   wf components used <siteId> [--collections a,b] [--json]
+//     (which components are placed INSIDE rich-text fields, and where. A
+//      component in rich text is stored as markup in the field, not as a
+//      reference, so nothing else can see it.)
+//   wf components migrate <siteId> --from <componentId> --to <componentId> [--collections a,b] [--dry]
+//     (swap one component for another everywhere it is used in rich text.
+//      `<wf-prop name>` holds a property ID, not a label, so the properties are
+//      paired on label AND type and the run refuses outright if any property
+//      cannot be mapped — swapping the component id alone leaves every instance
+//      rendering with empty values and reports no error.)
+//   wf images audit <siteId> [--collections a,b] [--own-buckets <24hex,…>] [--check-targets] [--json]
+//     (rich-text <img src> values that are not MANAGED assets of this site:
+//      a foreign host, another Webflow site, or this site's own cdn with no
+//      Assets-panel asset behind it. Webflow's own rich-text copy is the last
+//      kind — it serves, but cannot be found, replaced or reliably compressed,
+//      and each re-save of the item mints another orphan. --check-targets
+//      separates "foreign" from "already dead", and reports what each item
+//      COSTS a visitor — host classification cannot see weight, so a page whose
+//      images are all correctly hosted can still ship megabytes. Read-only;
+//      --dry is refused.)
+//   wf images adopt <collectionId> --site <siteId> [--item <id>…] [--folder <name>] [--only-foreign] [--max-width 1600] [--no-avif] [--avif-quality 65] [--out plan.json] [--dry]
+//     (downloads each foreign source, converts it to AVIF, uploads it as a real
+//      site asset, then repoints the html at it. Always --dry first: it prints
+//      the per-image before/after sizes and writes nothing. A source that no
+//      longer resolves is reported and LEFT ALONE — its url is the only record
+//      of what the image was. --only-foreign skips this site's own unmanaged
+//      copies, for the migration case alone. --dry still READS for real: the
+//      reads are what make the plan. Every image figure it writes is set to
+//      full width, with the figure's max-width cap moved to the real file
+//      width — the cap is what decides rendered size, so both move together.
+//      --max-width comes from the LAYOUT, not the source file: measure the
+//      rendered width of the rich-text column and double it for retina.)
 //     (same-site links in CMS rich-text and link fields that are absolute,
 //      trailing-slashed, or off the canonical host. --check-targets reports each
 //      destination's status. Read-only: it never rewrites and never infers
@@ -57,6 +89,11 @@
 //      the endpoint's own {"pages":[{id, jsonLdSchema}]} bulk body. --site
 //      routes through the site-scoped bulk endpoints, which are the ones a
 //      site-scoped grant can verify — always pass it.)
+//   wf publish <siteId> [--domains a.com,b.com | --subdomain] --confirm <siteId>
+//     (defaults to EVERY custom domain plus the webflow.io subdomain, and always
+//      prints what it published to. Publishing only the subdomain leaves the
+//      live site stale while reporting success, which is why the default is
+//      everything and narrowing has to be asked for.)
 //   wf get <path> | post | patch | put | delete      (raw)
 //   --dry on any invoke prints the exact request without sending.
 //   DELETE / publish / webhook creation also require --confirm <target-id>.
@@ -96,19 +133,35 @@ import { basename, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import pLimit from "p-limit";
 import prompts from "prompts";
+import { downloadToTemp, planAdoption, renderAdoptionPlan, replacementsFor } from "../lib/adopt-images.mjs";
 import { parseCliArgs } from "../lib/argv.mjs";
 import {
+  DEFAULT_AVIF_QUALITY,
+  DEFAULT_RICHTEXT_MAX_WIDTH,
   SUPPORTED_EXT,
   buildExistingAssetIndex,
+  cleanAssetName,
   dedupeLocalFiles,
   listAllAssets,
+  md5File,
   preflightSizeCheck,
+  prepareImageForUpload,
   resolveOrCreateFolder,
   uploadAssetFile
 } from "../lib/assets.mjs";
 import { endpointForRequest, knownGroups, resolveCallEndpoint } from "../lib/catalog.mjs";
 import { listCollectionsFree, listPagesFree, listSitesFree, listSitesFreeAllProfiles, webflowRequest } from "../lib/client.mjs";
 import { auditCollections, renderCmsAudit } from "../lib/cms-audit.mjs";
+import {
+  findComponentInstances,
+  mapProperties,
+  planComponentMigration,
+  propertyValues,
+  renderComponentUsage,
+  renderMigrationPlan,
+  summariseComponentUsage,
+  verifyComponentMigration
+} from "../lib/components.mjs";
 import { parseTtl, readJsonDetail } from "../lib/config.mjs";
 import { diagnose, formatDiagnosis, formatReference } from "../lib/doctor.mjs";
 import { ENDPOINTS } from "../lib/endpoints.mjs";
@@ -133,6 +186,17 @@ import {
 } from "../lib/profiles.mjs";
 import { checkSitePin, findProjectConfig, resolveProfile } from "../lib/project.mjs";
 import { renderAuditBloat, renderAuditFails, renderAuditReport, renderAuditTail } from "../lib/reporting.mjs";
+import {
+  IMAGE_HTML_FIELD_TYPES,
+  applySourceStatus,
+  auditRichTextImages,
+  bucketFromAssetUrl,
+  forceFullwidthFigures,
+  renderRichTextImageAudit,
+  spliceImgSrcs,
+  summariseWeight,
+  verifyAdoptedImages
+} from "../lib/richtext-images.mjs";
 import { BODY_CONTRACTS, contractFor, renderContract, validateBody } from "../lib/schemas.mjs";
 
 // ── argv ──────────────────────────────────────────────────────────────────────
@@ -182,6 +246,7 @@ const {
   flagType,
   flagName,
   flagTo,
+  flagFrom,
   flagOptions,
   flagRequired,
   flagIsRequired,
@@ -191,7 +256,14 @@ const {
   flagHosts,
   flagCanonical,
   flagRelatedHosts,
-  flagCheckTargets
+  flagCheckTargets,
+  flagItem,
+  flagOwnBuckets,
+  flagAvifQuality,
+  flagNoAvif,
+  flagOnlyForeign,
+  flagMaxWidth,
+  flagDomains
 } = parseCliArgs(process.argv.slice(2));
 
 if (liveClientAccess) {
@@ -1306,6 +1378,537 @@ if (cmd === "links" && positionals[1] === "audit") {
   process.exit(0);
 }
 
+// Read a site's collections with all their items. Shared by the commands that
+// have to look INSIDE field values — component instances and rich-text images
+// are both stored as markup, so there is no way to find them without the items.
+const readCollectionsWithItems = async ({ siteId, wanted = null, requiresHtmlField = false }) => {
+  const list = await request({ method: "GET", path: `sites/${siteId}/collections` });
+  if (!list.ok) out(list, { path: `sites/${siteId}/collections`, method: "GET" });
+
+  const want = wanted?.length ? new Set(wanted.map((value) => value.toLowerCase())) : null;
+  const summaries = (Array.isArray(list.data?.collections) ? list.data.collections : []).filter(
+    (summary) => !want || want.has(String(summary?.slug || "").toLowerCase()) || want.has(String(summary?.id || "").toLowerCase())
+  );
+  if (want && !summaries.length)
+    die(`No collection matched --collections ${wanted.join(",")}.`, `wf collections ${siteId} lists the slugs and ids on this site.`);
+
+  const collections = [];
+  for (const summary of summaries) {
+    const id = String(summary?.id || "");
+    if (!id) continue;
+    const full = await request({ method: "GET", path: `collections/${id}` });
+    if (!full.ok) out(full, { path: `collections/${id}`, method: "GET" });
+
+    const fields = Array.isArray(full.data?.fields) ? full.data.fields : [];
+    if (requiresHtmlField && !fields.some((field) => IMAGE_HTML_FIELD_TYPES.has(String(field?.type || "")))) {
+      collections.push({ ...full.data, items: [] });
+      continue;
+    }
+    const paged = await listAllItems({ requestFn: request, collectionId: id });
+    if (!paged.ok) out(paged.page, { path: `collections/${id}/items`, method: "GET" });
+    collections.push({ ...full.data, items: paged.items });
+  }
+  return collections;
+};
+
+// `wf publish <siteId>` — publish, to everywhere by default.
+//
+// The shortcut this replaces sent only `publishToWebflowSubdomain`, never any
+// custom domain, so a publish could report success while the live site stayed
+// stale — the worst possible failure for a command whose whole job is "make it
+// live". Observed twice: staging updated, the .co.uk did not.
+//
+// So the default is every domain the site has. Narrowing is explicit, and the
+// output always names exactly what was published.
+if (cmd === "publish") {
+  const usage = "Usage: wf publish <siteId> [--domains a.com,b.com | --subdomain] [--dry] --confirm <siteId>";
+  const siteId = positionals[1];
+  if (!siteId) die(usage, "Defaults to every custom domain plus the webflow.io subdomain. wf sites lists the site ids.");
+
+  const site = await request({ method: "GET", path: `sites/${siteId}` });
+  if (!site.ok) out(site, { path: `sites/${siteId}`, method: "GET" });
+  const domains = Array.isArray(site.data?.customDomains) ? site.data.customDomains : [];
+
+  let chosen = domains;
+  if (flagDomains?.length) {
+    const want = new Set(flagDomains.map((one) => one.toLowerCase().replace(/^https?:\/\//, "")));
+    chosen = domains.filter((one) => want.has(String(one.url || "").toLowerCase()));
+    const missing = [...want].filter((one) => !domains.some((domain) => String(domain.url || "").toLowerCase() === one));
+    if (missing.length)
+      die(`Not a custom domain on this site: ${missing.join(", ")}.`, `This site has: ${domains.map((one) => one.url).join(", ") || "(none)"}`);
+  }
+  // --subdomain means staging only, so it is the one case with no custom domains.
+  if (subdomain && !flagDomains?.length) chosen = [];
+
+  const body = { publishToWebflowSubdomain: subdomain || !flagDomains?.length, ...(chosen.length ? { customDomains: chosen.map((one) => one.id) } : {}) };
+
+  const targets = [...chosen.map((one) => one.url), ...(body.publishToWebflowSubdomain ? [`${site.data?.shortName || siteId}.webflow.io`] : [])];
+  if (!targets.length) die("Nothing to publish to.", usage);
+
+  console.error(`… publishing ${site.data?.displayName || siteId} to: ${targets.join(", ")}`);
+  if (domains.length && !chosen.length && !subdomain)
+    console.error(`  NOTE: this site has ${domains.length} custom domain(s) and none are included. The live site will not change.`);
+
+  const path = `sites/${siteId}/publish`;
+  const done = await request({ method: "POST", path, body });
+  if (!done.ok || done.dryRun) out(done, { path, method: "POST" });
+  out({ ok: true, status: done.status, data: { publishedTo: targets, ...done.data } }, { path, method: "POST" });
+}
+
+// `wf components used <siteId>` — which components appear inside rich-text
+// fields, and where. Read-only. A component placed in rich text is stored as
+// markup in the field rather than as a reference, so it is invisible to every
+// other listing; this is the only way to see the usage before changing one.
+if (cmd === "components" && positionals[1] === "used") {
+  const siteId = positionals[2];
+  if (!siteId) die("Usage: wf components used <siteId> [--collections a,b] [--json]", "wf sites lists the site ids you have been granted.");
+  if (dryRun) die("wf components used is read-only, so --dry has nothing to suppress.", "Run it without --dry.");
+
+  const collections = await readCollectionsWithItems({ siteId, wanted: flagCollections });
+  const rows = summariseComponentUsage({ collections });
+  console.log(flagJson ? JSON.stringify(rows, null, 2) : renderComponentUsage(rows));
+  process.exit(0);
+}
+
+// `wf components migrate <siteId> --from <id> --to <id>` — swap one component
+// for another everywhere it is used inside rich text.
+//
+// The trap this exists for: `<wf-prop name>` carries a property ID, not a
+// label, and two components with identical property names have entirely
+// different IDs. Swapping the component id alone leaves every instance
+// rendering with empty values, and nothing reports an error. So the properties
+// are paired on label AND type, the run refuses outright if any property on any
+// instance cannot be mapped, and every field is proved against a fresh readback
+// afterwards.
+if (cmd === "components" && positionals[1] === "migrate") {
+  const siteId = positionals[2];
+  const usage = "Usage: wf components migrate <siteId> --from <componentId> --to <componentId> [--collections a,b] [--dry]";
+  if (!siteId) die(usage, "wf components used <siteId> lists the components in play and their ids.");
+  if (!flagFrom || !flagTo) die("--from and --to are both required (component ids).", usage);
+  if (flagFrom === flagTo) die("--from and --to are the same component.");
+
+  const [fromProps, toProps] = await Promise.all([
+    request({ method: "GET", path: `sites/${siteId}/components/${flagFrom}/properties` }),
+    request({ method: "GET", path: `sites/${siteId}/components/${flagTo}/properties` })
+  ]);
+  if (!fromProps.ok) out(fromProps, { path: `sites/${siteId}/components/${flagFrom}/properties`, method: "GET" });
+  if (!toProps.ok) out(toProps, { path: `sites/${siteId}/components/${flagTo}/properties`, method: "GET" });
+
+  const mapping = mapProperties({ from: fromProps.data?.properties || [], to: toProps.data?.properties || [] });
+
+  const list = await request({ method: "GET", path: `sites/${siteId}/components`, query: { limit: 100 } });
+  const toName = (list.ok ? list.data?.components || [] : []).find((one) => one.id === flagTo)?.name || null;
+
+  const collections = await readCollectionsWithItems({ siteId, wanted: flagCollections });
+
+  const plans = [];
+  for (const collection of collections) {
+    for (const item of collection.items) {
+      for (const [fieldSlug, value] of Object.entries(item?.fieldData || {})) {
+        if (typeof value !== "string" || !value.includes(`component-id="${flagFrom}"`)) continue;
+        const plan = planComponentMigration({ html: value, fromComponentId: flagFrom, toComponentId: flagTo, toName, propertyMap: mapping.mapped });
+        plans.push({
+          ...plan,
+          collectionId: collection.id,
+          itemId: item.id,
+          itemSlug: item?.fieldData?.slug || item.id,
+          fieldSlug,
+          expectedValues: propertyValues(value)
+        });
+      }
+    }
+  }
+
+  if (!plans.length) {
+    console.log(`Nothing to migrate — no rich-text field uses component ${flagFrom}.`);
+    process.exit(0);
+  }
+
+  console.log(renderMigrationPlan({ mapping, plans }));
+
+  const blocked = plans.filter((plan) => !plan.ok);
+  if (blocked.length || !mapping.ok) {
+    console.log("");
+    for (const plan of blocked) console.log(`  ${plan.itemSlug} . ${plan.fieldSlug}: ${plan.error}`);
+    die(
+      `[${CODES.WF_COMPONENT_PROP_UNMAPPED}] Refusing to migrate: ${mapping.unmapped.length} unmapped property definition(s), ${blocked.length} field(s) blocked.`,
+      "Every property must pair on label AND type. Add the missing properties to the target component, then re-run."
+    );
+  }
+
+  if (dryRun) {
+    console.log("\n--dry: nothing written.");
+    process.exit(0);
+  }
+
+  const results = [];
+  for (const plan of plans.filter((one) => one.changed)) {
+    const path = `collections/${plan.collectionId}/items/${plan.itemId}`;
+    const written = await request({ method: "PATCH", path, body: { fieldData: { [plan.fieldSlug]: plan.html } } });
+    if (!written.ok) out(written, { path, method: "PATCH" });
+
+    const reread = await request({ method: "GET", path });
+    if (!reread.ok)
+      out(
+        { ...reread, errorCode: CODES.WF_WRITE_UNVERIFIED, error: `Migration written but the readback failed: ${reread.error || "unknown"}` },
+        { path, method: "GET" }
+      );
+
+    const verification = verifyComponentMigration({
+      html: reread.data?.fieldData?.[plan.fieldSlug],
+      fromComponentId: flagFrom,
+      toComponentId: flagTo,
+      propertyMap: mapping.mapped,
+      expectedValues: plan.expectedValues
+    });
+    if (!verification.ok)
+      out(
+        {
+          ok: false,
+          errorCode: CODES.WF_WRITE_UNVERIFIED,
+          error: verification.error,
+          details: { itemId: plan.itemId, fieldSlug: plan.fieldSlug, ...verification }
+        },
+        { path, method: "GET" }
+      );
+    results.push({ item: plan.itemSlug, field: plan.fieldSlug, instances: plan.changed });
+  }
+
+  const total = results.reduce((sum, one) => sum + one.instances, 0);
+  console.log(`\nMigrated ${total} instance(s) across ${results.length} field(s). Every value verified against a fresh readback.`);
+  process.exit(0);
+}
+
+// `wf images audit <siteId>` — rich-text images that are not this site's own
+// assets. Sibling of `links audit`: same read-only contract, same shape, and
+// the same reason for existing. A migration carries `<img src>` across as it
+// was written, Webflow copies the file only when it can take it (measured: a
+// source over the 4MB cap is skipped silently, per image), and every reference
+// it did not copy is a live dependency on a host we do not control. Nothing
+// looks broken until that host goes away, and then the image is unrecoverable.
+if (cmd === "images" && positionals[1] === "audit") {
+  const siteId = positionals[2];
+  const usage = "Usage: wf images audit <siteId> [--collections a,b] [--own-buckets <24hex,…>] [--check-targets] [--json]";
+  if (!siteId) die(usage, "wf sites lists the site ids you have been granted.");
+  // Refused rather than ignored: --dry stubs every read, and a report built on
+  // stubs would say "everything is a managed asset" — a false clean, which is
+  // the worst possible output for an audit.
+  if (dryRun) die("wf images audit is read-only, so --dry has nothing to suppress.", "Run it without --dry.");
+
+  // A site's assets are served from a bucket id that is NOT its site id, and
+  // A site serves images from two buckets. One IS the site id and holds
+  // Assets-panel assets; the other is a sibling id and holds rich-text images.
+  // The site id therefore comes free, and the rich-text bucket is learned from
+  // the Image field values in the items being read anyway. No assets list is
+  // needed: every url in the rich-text bucket is a non-panel asset by
+  // definition, so the bucket alone classifies it.
+  const ownBuckets = new Set([siteId.toLowerCase(), ...(flagOwnBuckets || []).map((one) => one.toLowerCase())]);
+
+  const list = await request({ method: "GET", path: `sites/${siteId}/collections` });
+  if (!list.ok) out(list, { path: `sites/${siteId}/collections`, method: "GET" });
+
+  const wanted = flagCollections?.length ? new Set(flagCollections.map((value) => value.toLowerCase())) : null;
+  const summaries = (Array.isArray(list.data?.collections) ? list.data.collections : []).filter(
+    (summary) => !wanted || wanted.has(String(summary?.slug || "").toLowerCase()) || wanted.has(String(summary?.id || "").toLowerCase())
+  );
+  if (wanted && !summaries.length)
+    die(`No collection matched --collections ${flagCollections.join(",")}.`, `wf collections ${siteId} lists the slugs and ids on this site.`);
+
+  const collections = [];
+  for (const summary of summaries) {
+    const id = String(summary?.id || "");
+    if (!id) continue;
+    const full = await request({ method: "GET", path: `collections/${id}` });
+    if (!full.ok) out(full, { path: `collections/${id}`, method: "GET" });
+
+    // Only fetch items for a collection that has somewhere to hold an <img>.
+    const fields = Array.isArray(full.data?.fields) ? full.data.fields : [];
+    if (!fields.some((field) => IMAGE_HTML_FIELD_TYPES.has(String(field?.type || "")))) {
+      collections.push({ ...full.data, items: [] });
+      continue;
+    }
+    const paged = await listAllItems({ requestFn: request, collectionId: id });
+    if (!paged.ok) out(paged.page, { path: `collections/${id}/items`, method: "GET" });
+    collections.push({ ...full.data, items: paged.items });
+
+    for (const item of paged.items) {
+      for (const value of Object.values(item?.fieldData || {})) {
+        const bucket = bucketFromAssetUrl(value?.url);
+        if (bucket) ownBuckets.add(bucket);
+      }
+    }
+  }
+
+  const report = auditRichTextImages({ collections, ownBuckets, siteId });
+
+  // Opt-in liveness probe, same reasoning as links audit --check-targets: it
+  // separates "points somewhere foreign" from "already dead", and dead is the
+  // one that cannot be fixed later.
+  let imageReport = report;
+  if (flagCheckTargets && report.sources.length) {
+    if (!flagJson) console.error(`… checking ${report.sources.length} source(s)`);
+    const limit = pLimit(6);
+    const statuses = new Map();
+    await Promise.all(
+      report.sources.map((source) =>
+        limit(async () => {
+          try {
+            const res = await fetch(source.src, { method: "GET", redirect: "follow" });
+            // Prefer the header, but fall back to draining the body: Webflow's
+            // cdn omits content-length on some responses, and a missing weight
+            // reads as "this page is fine" when it may be the opposite.
+            const declared = Number(res.headers?.get?.("content-length"));
+            const bytes = Number.isFinite(declared) && declared > 0 ? declared : ((await res.arrayBuffer().catch(() => null))?.byteLength ?? null);
+            statuses.set(source.src, { status: res.status, bytes });
+          } catch (e) {
+            statuses.set(source.src, { error: e.message });
+          }
+        })
+      )
+    );
+    imageReport = applySourceStatus(report, statuses);
+    imageReport = { ...imageReport, weight: summariseWeight(imageReport) };
+  }
+
+  console.log(flagJson ? JSON.stringify({ ...imageReport, ownBuckets: [...ownBuckets] }, null, 2) : renderRichTextImageAudit(imageReport));
+  process.exit(0);
+}
+
+// `wf images adopt <collectionId> --site <siteId>` — bring every foreign
+// rich-text image into this site's assets and repoint the html at it.
+//
+// Deliberately not "let Webflow copy it": Webflow's copy is silent about what
+// it skipped, produces something that never appears in the Assets panel, and
+// cannot be compressed or replaced afterwards. Converting to AVIF here means
+// the asset we upload is already the small one, so there is nothing to press
+// Compress on and no second rewrite.
+//
+// Order is download-and-convert, then upload, then write items. A run that
+// dies while uploading has made assets and changed no content, so running it
+// again is safe. Interleaving writes would leave items half repointed.
+if (cmd === "images" && positionals[1] === "adopt") {
+  const collectionId = positionals[2];
+  const usage =
+    "Usage: wf images adopt <collectionId> --site <siteId> [--item <id>…] [--folder <name>] [--no-avif] [--avif-quality 65] [--out plan.json] [--dry]";
+  if (!collectionId) die(usage);
+  if (!flagSite) die("wf images adopt requires --site <siteId> — the asset upload is a site-level call.", usage);
+  const pinError = checkSitePin(project, `sites/${flagSite}/assets`);
+  if (pinError) die(`[${CODES.WF_SITE_PIN}] ${pinError}`);
+  const quality = flagAvifQuality == null ? DEFAULT_AVIF_QUALITY : flagAvifQuality;
+  // 1600 suits a rich-text column that renders around 800px at 2x. Measure the
+  // real column on the site and override when it differs.
+  const maxWidth = flagMaxWidth == null ? DEFAULT_RICHTEXT_MAX_WIDTH : flagMaxWidth;
+  if (!Number.isInteger(maxWidth) || maxWidth < 1) die("--max-width must be a positive whole number of pixels.");
+  if (!Number.isFinite(quality) || quality < 1 || quality > 100) die("--avif-quality must be a number between 1 and 100.");
+
+  // --dry on this command means "plan it, change nothing". The plan IS the
+  // reads, so they run for real; request() would apply --dry to them and hand
+  // back stubs, which reads exactly like an empty collection.
+  const readLive = async ({ path, query }) => {
+    const readPinError = checkSitePin(project, path);
+    if (readPinError) die(`[${CODES.WF_SITE_PIN}] ${readPinError}`);
+    return webflowRequest({ profile, method: "GET", path, query, dryRun: false, project });
+  };
+
+  const ownBuckets = new Set([flagSite.toLowerCase(), ...(flagOwnBuckets || []).map((one) => one.toLowerCase())]);
+  const existing = await listAllAssets({ profile, siteId: flagSite, project });
+  if (!existing.ok) die(`Could not list this site's assets: ${existing.error}`);
+  for (const asset of existing.assets) {
+    const bucket = bucketFromAssetUrl(asset?.hostedUrl);
+    if (bucket) ownBuckets.add(bucket);
+  }
+
+  const full = await readLive({ path: `collections/${collectionId}` });
+  if (!full.ok) out(full, { path: `collections/${collectionId}`, method: "GET" });
+  const paged = await listAllItems({ requestFn: readLive, collectionId });
+  if (!paged.ok) out(paged.page, { path: `collections/${collectionId}/items`, method: "GET" });
+  for (const item of paged.items) {
+    for (const value of Object.values(item?.fieldData || {})) {
+      const bucket = bucketFromAssetUrl(value?.url);
+      if (bucket) ownBuckets.add(bucket);
+    }
+  }
+  const wholeReport = auditRichTextImages({ collections: [{ ...full.data, items: paged.items }], ownBuckets, siteId: flagSite });
+  // --only-foreign is the migration case: bring in what depends on a host we do
+  // not control, and leave our own unmanaged copies for a separate pass.
+  const report = flagOnlyForeign ? { ...wholeReport, findings: wholeReport.findings.filter((finding) => finding.kind !== "own-unmanaged") } : wholeReport;
+  if (!report.findings.length) {
+    console.log("Nothing to adopt — every rich-text image in this collection is already a managed asset of this site.");
+    process.exit(0);
+  }
+  const plan = planAdoption({ report, itemIds: flagItem });
+  if (!plan.counts.findings) die(`No finding matched --item ${flagItem.join(",")}.`, "Run wf images audit to see which items are affected.");
+
+  // Refuse before the first write, not at image 60 of 200: every webflowRequest
+  // spends a grant call and a grant that runs dry mid-run self-revokes.
+  const grant = getGrant(profile);
+  const remaining = grant?.maxCalls == null ? null : grant.maxCalls - grant.callsUsed;
+  if (remaining != null && remaining < plan.estimatedCalls && !dryRun)
+    die(
+      `This run needs about ${plan.estimatedCalls} api calls and the current grant has ${remaining} left.`,
+      `Ask for a bigger budget:  wf grant ${profile} --sites ${flagSite} --write --max-calls ${plan.estimatedCalls * 2}`
+    );
+
+  const tmpRoot = mkdtempSync(join(tmpdir(), "wf-adopt-"));
+  const results = [];
+  try {
+    // Fetch and convert everything first. A source that is gone is the normal
+    // case this command exists for: it is reported and left alone, never
+    // rewritten, because the dead url is the only surviving record of what the
+    // image was.
+    const urlBySrc = new Map();
+    const assetIdByUrl = new Map();
+    const widthByUrl = new Map();
+    const unresolved = [];
+    const prepared = [];
+    const limit = pLimit(Math.max(1, Number(flagConcurrency) || 4));
+    await Promise.all(
+      plan.sources.map((src) =>
+        limit(async () => {
+          const got = await downloadToTemp({ src, tmpDir: tmpRoot });
+          if (!got.ok) {
+            unresolved.push({ src, error: got.error, errorCode: CODES.WF_IMAGE_SOURCE_GONE });
+            return;
+          }
+          const ready = prepareImageForUpload(got.file, tmpRoot, { avif: !flagNoAvif, quality, maxWidth });
+          prepared.push({ src, ...got, ...ready, displayName: cleanAssetName(basename(ready.uploadFile)) });
+        })
+      )
+    );
+
+    if (dryRun) {
+      console.log(renderAdoptionPlan(plan, { unresolved }));
+      console.log("");
+      for (const one of prepared)
+        console.log(
+          `  ${one.displayName.slice(0, 46).padEnd(48)} ${(one.originalSize / 1024).toFixed(0).padStart(7)}KB -> ${(one.finalSize / 1024).toFixed(0).padStart(7)}KB  ${String(one.originalWidth ?? "?").padStart(5)}px -> ${String(one.finalWidth ?? "?").padStart(5)}px${one.converted ? " avif" : ""}${one.resized ? " resized" : ""}${one.overCap ? "  STILL OVER CAP, would be skipped" : ""}`
+        );
+      console.log("\n--dry: nothing uploaded, nothing written.");
+      process.exit(0);
+    }
+
+    // Dedup by content before uploading: the same image reused across ten
+    // articles is one asset, and re-running should not create eleven more.
+    const byHash = new Map();
+    const assetIndex = buildExistingAssetIndex(existing.assets);
+    for (const one of prepared) {
+      if (one.overCap) {
+        unresolved.push({ src: one.src, error: `still ${(one.finalSize / 1024 / 1024).toFixed(1)}MB after conversion, over Webflow's cap` });
+        continue;
+      }
+      const hash = md5File(one.uploadFile);
+      const already = byHash.get(hash);
+      if (already) {
+        urlBySrc.set(one.src, already);
+        continue;
+      }
+      const reuse = assetIndex.get(`${one.displayName}::${one.finalSize}`);
+      if (reuse?.hostedUrl) {
+        if (reuse.id) assetIdByUrl.set(reuse.hostedUrl, String(reuse.id).toLowerCase());
+        byHash.set(hash, reuse.hostedUrl);
+        urlBySrc.set(one.src, reuse.hostedUrl);
+        results.push({ ok: true, src: one.src, reused: true, hostedUrl: reuse.hostedUrl });
+        continue;
+      }
+      const folder = flagFolder
+        ? await resolveOrCreateFolder({ profile, siteId: flagSite, folderNameOrId: flagFolder, project })
+        : { ok: true, folderId: null };
+      if (!folder.ok) die(folder.error);
+      const uploaded = await uploadAssetFile({
+        profile,
+        siteId: flagSite,
+        filePath: one.uploadFile,
+        displayName: one.displayName,
+        folderId: folder.folderId,
+        project
+      });
+      if (!uploaded.ok || !uploaded.hostedUrl) {
+        unresolved.push({ src: one.src, error: uploaded.error || "upload returned no hostedUrl" });
+        results.push({ ok: false, src: one.src, error: uploaded.error });
+        continue;
+      }
+      if (uploaded.assetId) assetIdByUrl.set(uploaded.hostedUrl, String(uploaded.assetId).toLowerCase());
+      if (Number.isInteger(one.finalWidth)) widthByUrl.set(uploaded.hostedUrl, one.finalWidth);
+      byHash.set(hash, uploaded.hostedUrl);
+      urlBySrc.set(one.src, uploaded.hostedUrl);
+      results.push({ ok: true, src: one.src, assetId: uploaded.assetId, hostedUrl: uploaded.hostedUrl, bytes: one.finalSize, converted: one.converted });
+    }
+
+    // Now the content. Offsets came from the html we are splicing, and
+    // spliceImgSrcs re-checks every one against the live bytes, so a stale
+    // plan is refused rather than misapplied. A concurrent edit between the
+    // read above and this write would be overwritten — run this when nobody
+    // is editing the collection.
+    const itemsById = new Map(paged.items.map((item) => [item.id, item]));
+    for (const planned of plan.items) {
+      const item = itemsById.get(planned.itemId);
+      if (!item) continue;
+      const fieldData = {};
+      const expectedByField = new Map();
+      for (const field of planned.fields) {
+        const html = item.fieldData?.[field.fieldSlug];
+        const replacements = replacementsFor({ hits: field.hits, urlBySrc });
+        if (!replacements.length) continue;
+        const spliced = spliceImgSrcs(html, replacements);
+        if (!spliced.ok)
+          out(
+            { ok: false, errorCode: CODES.WF_IMAGE_SPLICE_REFUSED, error: spliced.error, details: { itemId: planned.itemId, field: field.fieldSlug } },
+            { path: `collections/${collectionId}/items/${planned.itemId}`, method: "PATCH" }
+          );
+        // Every rich-text image is rendered full width. The alignment and the
+        // figure's max-width cap are set together: the cap is what actually
+        // decides the rendered width, so moving one without the other would
+        // leave a small original still capped at its old size.
+        const aligned = forceFullwidthFigures(spliced.html, { widthByUrl });
+        fieldData[field.fieldSlug] = aligned.html;
+        // Asset ids, not urls: Webflow rewrites the url it stores but keeps the
+        // id of the asset it copied from inside the new filename, so the id is
+        // the only thing that survives to be checked.
+        expectedByField.set(field.fieldSlug, [...new Set(replacements.map((one) => assetIdByUrl.get(one.to)).filter(Boolean))]);
+      }
+      if (!Object.keys(fieldData).length) continue;
+
+      const path = `collections/${collectionId}/items/${planned.itemId}`;
+      const written = await request({ method: "PATCH", path, body: { fieldData } });
+      if (!written.ok) out(written, { path, method: "PATCH" });
+
+      const reread = await request({ method: "GET", path });
+      if (!reread.ok)
+        out(
+          { ...reread, errorCode: CODES.WF_WRITE_UNVERIFIED, error: `Item PATCH completed but fresh readback failed: ${reread.error || "unknown read error"}` },
+          { path, method: "GET" }
+        );
+      for (const [fieldSlug, expected] of expectedByField) {
+        const verification = verifyAdoptedImages({ html: reread.data?.fieldData?.[fieldSlug], siteId: flagSite, ownBuckets, expectedAssetIds: expected });
+        if (!verification.ok)
+          out(
+            { ok: false, errorCode: CODES.WF_WRITE_UNVERIFIED, error: verification.error, details: { itemId: planned.itemId, fieldSlug, ...verification } },
+            { path, method: "GET" }
+          );
+      }
+      results.push({ ok: true, itemId: planned.itemId, itemSlug: planned.itemSlug, fields: Object.keys(fieldData), verified: true });
+    }
+
+    if (flagOut) writeFileSync(resolve(flagOut), JSON.stringify({ plan: plan.counts, unresolved, results }, null, 2));
+    const uploads = results.filter((one) => one.hostedUrl);
+    const saved = uploads.reduce((total, one) => total + (one.bytes || 0), 0);
+    console.log(
+      [
+        `Adopted ${uploads.length} image(s) into this site's assets across ${results.filter((one) => one.itemId).length} item(s).`,
+        `  uploaded bytes after conversion: ${(saved / 1024 / 1024).toFixed(2)}MB`,
+        unresolved.length ? `  ${unresolved.length} source(s) left untouched (see below) — their original urls are preserved.` : "",
+        ...unresolved.map((one) => `    ${one.error.slice(0, 60).padEnd(62)} ${one.src.slice(0, 90)}`),
+        flagOut ? `  manifest: ${resolve(flagOut)}` : ""
+      ]
+        .filter(Boolean)
+        .join("\n")
+    );
+    process.exit(unresolved.length ? 1 : 0);
+  } finally {
+    rmSync(tmpRoot, { recursive: true, force: true });
+  }
+}
+
 // `wf fields add <collectionId> --type <Type> --name <DisplayName> […]` —
 // typed field creation. One historical failure this closes: "Reference fields
 // must have a collectionId", previously only prose in lib/schemas.mjs's
@@ -1615,8 +2218,7 @@ const shortcuts = {
   collections: () => ({ method: "GET", path: `sites/${positionals[1]}/collections` }),
   collection: () => ({ method: "GET", path: `collections/${positionals[1]}` }),
   items: () => ({ method: "GET", path: `collections/${positionals[1]}/items`, query: { limit: positionals[2] || 25 } }),
-  pages: () => ({ method: "GET", path: `sites/${positionals[1]}/pages` }),
-  publish: () => ({ method: "POST", path: `sites/${positionals[1]}/publish`, body: { publishToWebflowSubdomain: subdomain } })
+  pages: () => ({ method: "GET", path: `sites/${positionals[1]}/pages` })
 };
 if (shortcuts[cmd]) {
   if (cmd !== "sites" && !positionals[1]) die(`${cmd} requires an id. See \`wf help\`.`);

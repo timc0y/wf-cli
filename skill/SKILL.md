@@ -3,10 +3,11 @@ name: wf-cli
 description: >-
   Use the `wf` CLI to read or change Webflow CMS data and site settings. Use for
   collections, fields, items, pages, SEO data, assets, forms, redirects,
-  localisation, CMS item publishing, auditing internal links left inside CMS
-  content by a migration, or site-publication preparation through the Webflow
-  Data API. The command only works after a person grants access to the
-  named site.
+  localisation, CMS item publishing, auditing internal links or rich-text images
+  left inside CMS content by a migration, bringing those images in as real site
+  assets, finding or swapping components placed inside rich-text fields, or
+  site-publication preparation through the Webflow Data API. The
+  command only works after a person grants access to the named site.
 ---
 
 # Webflow Data API CLI
@@ -107,6 +108,11 @@ result. A successful HTTP response alone is not completion.
     wf items set <collId> <itemId> --set slug=value    # typed CMS item write
     wf item publish <collId> <itemId…>             # bulk publish
     wf links audit <siteId> --hosts a.com,www.a.com [--canonical www.a.com]   # same-site link hygiene
+    wf images audit <siteId> --check-targets       # rich-text images: host AND weight per item
+    wf publish <siteId> --confirm <siteId>         # every custom domain, not just staging
+    wf images adopt <collId> --site <id> --dry     # bring them in as real assets, as AVIF
+    wf components used <siteId>                    # components placed inside rich-text fields
+    wf components migrate <siteId> --from <id> --to <id> --dry   # swap one for another
     wf audit report                # what happened lately
     wf assets upload <file...> --site <id> [--dir <path>] [--folder <name>] --dry
 
@@ -184,6 +190,54 @@ infers where one ought to point instead.
 
 Read [links.md](references/links.md) for the options, what counts as internal,
 and what the command deliberately leaves alone.
+
+## Check rich-text images before the old site is switched off
+
+An image field is a pointer Webflow maintains. A rich-text field is HTML, and
+Webflow does not maintain what is inside it: an `<img src>` written by an import
+is copied onto this site only when Webflow can take the file, a source over the
+4MB cap is skipped silently, and it is per image, not per item. So a migrated
+article renders correctly while still depending on a host we do not control, and
+the day that host goes away the image is gone and cannot be re-sourced from it.
+
+There is a second problem behind the first. Copied or not, a rich-text image is
+never an Assets-panel asset, so it cannot be found, replaced or reliably
+compressed, and each re-save of the item mints another orphan copy beside it.
+
+`wf images audit <siteId>` reports every rich-text image that is not a managed
+asset of this site — a foreign host, another Webflow site, or this site's own cdn
+with no asset behind it — grouped by source and by item. Add `--check-targets` to
+separate "points somewhere foreign" from "already dead". Run it before a client
+decommissions their old CMS: free to fix then, impossible afterwards.
+
+`wf images adopt <collectionId> --site <siteId>` fixes them — it downloads each
+source, converts it to AVIF, uploads it as a real site asset, and repoints the
+html. Always `--dry` first; it prints per-image before/after sizes and writes
+nothing. A source that no longer resolves is reported and left untouched,
+because its url is the only surviving record of what the image was.
+
+Read [images.md](references/images.md) for the mechanics, the caveats, and why
+Webflow's own Compress is not a substitute.
+
+## Change a component that is used inside rich text
+
+A component placed in a CMS rich-text field is stored as markup in the field, not
+as a reference, so no other listing shows the connection. `wf components used
+<siteId>` is the only way to see which components the content depends on — check
+it before changing or deleting one, because a component used only inside rich
+text looks unused everywhere else.
+
+`wf components migrate <siteId> --from <id> --to <id>` swaps one for another
+across every item. `--dry` first: it prints the property mapping and every field
+it would touch.
+
+The trap it exists for is that `<wf-prop name>` holds a property ID, not a label.
+Swapping the component id alone leaves every instance rendering with empty
+values and reports no error, so properties are paired on label and type and the
+run refuses if any cannot be mapped.
+
+Read [components.md](references/components.md) for the storage format, the
+refusals, and what the command deliberately leaves alone.
 
 ## Safer CMS editing
 
