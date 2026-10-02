@@ -204,6 +204,25 @@ animation, and AVIF would raster a vector.
 
 Conversion uses macOS `sips`, same as the existing upload downscale.
 
+## The converted file is decoded before it is uploaded
+
+`adopt` converts the file itself, so it can manufacture an image that is the
+right size, the right dimensions and the right content-type and still shows
+nothing. Measured 2026-09-10: four PNGs converted with `sips -s format avif`
+uploaded cleanly, served 200 as `image/avif`, and every sampled pixel came back
+`(0,0,0)`. Byte count, dimensions and http status all passed.
+
+So every converted file is decoded and sampled on a 9x9 grid before it is
+uploaded. A file that will not decode, or whose samples are all identical, is
+refused: it is not uploaded and its item is not rewritten, so the original url
+stays in the html. `--dry` reports the same measurement per file as
+`<unique>/<total> unique`.
+
+`--allow-uniform` permits a deliberately flat image. `--no-avif` adopts the
+source untouched, which is the usual answer when the conversion is what broke.
+`--skip-pixel-check` skips decoding. The check needs `ffmpeg` on PATH; without
+it the run says the check is unavailable rather than reporting a pass.
+
 ## Concurrency, in both directions
 
 `adopt` reads items and then writes them, so a Designer edit made in between is

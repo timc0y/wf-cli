@@ -109,6 +109,76 @@ untested.
 attempt appeared to do nothing, but those assets are unprocessed records
 (`size: 0`), so they are poor subjects. Retest on a normal asset.
 
+## A second silent failure: an image with nothing in it
+
+Measured 2026-09-10. Four PNGs were converted to AVIF with macOS
+`sips -s format avif`, uploaded with `wf assets upload`, and bound to CMS items.
+Every check the pipeline and the operator made passed:
+
+* file sizes plausible, and under the 4MB cap
+* dimensions correct at 1661x947
+* uploaded bytes identical to the local file
+* HTTP 200 from the CDN, `content-type: image/avif`
+
+They decoded to solid black. Every sampled pixel was `(0,0,0)`. `ffprobe`
+showed `sips` had written each file as a grid of 512x512 tiles whose
+composition came out empty. The defect reached a live client site and was found
+by a person opening the url.
+
+This is the same class as the 4MB skip above: everything reports success, and
+the thing that is wrong is invisible to every layer that reports.
+
+**What is established.** Nothing in the pipeline read a pixel. Byte count,
+dimensions, extension, content-type, http status and md5 are all properties of
+the container, and all six can be correct for a canvas with nothing on it.
+
+**What is inference.** That the tile grid is the mechanism. `ffprobe` shows the
+tiling and the operator saw black, but a tiled AVIF is not by itself broken —
+an attempt to reproduce it here, converting a 1661x947 test pattern with the
+same `sips` command on the same machine, produced a tiled AVIF that decodes to
+the correct picture. So the tiling is present in both the broken and the working
+case, and what separated them is not established.
+
+**What is still not established.** Which `sips`/ImageIO condition produces the
+empty composition, and whether Webflow's own processing ever introduces it.
+Both were left unanswered on purpose: the check below does not depend on
+knowing, because it measures the output rather than predicting it.
+
+### What now prevents it
+
+`wf assets upload` and `wf images adopt` decode every image and read a 9x9 grid
+of points spread across the canvas — nearest neighbour, never an averaging
+downscale, so the numbers are actual decoded pixels rather than a mean that
+could hide the thing being looked for. `adopt` checks the file it converted,
+because that command produces the defect itself; `upload` checks the file it is
+about to send, so a resized copy is checked rather than its source. Both run
+before the first network call.
+
+A run is refused when a file will not decode, or when every sampled point is
+identical. The refusal reports the measurement — how many unique samples out of
+how many, the uniform value, and the mean — never a verdict on its own, because
+a uniform canvas is a defect in a photograph and correct in a solid-colour
+swatch and only a person knows which file this is. `--allow-uniform` says the
+flat colour is deliberate. `--skip-pixel-check` skips decoding entirely; the two
+are separate flags on purpose, so a manifest can tell "checked, flat, intended"
+from "never looked".
+
+The decoder is `ffmpeg`. It was chosen over a Node image library because it
+composes an AVIF tile grid: `sips` writes a 1661x947 AVIF as eight 512x512 AV1
+streams, and a decoder that reads only the first stream would sample one tile
+and pass a file whose composition is empty — the exact layer the failure lived
+in. A native npm dependency was rejected as disproportionate for reading 81
+pixels on the operator's own machine, on a package other people install.
+
+Where `ffmpeg` is absent the run says the check is **unavailable** and that the
+images are unverified. It does not report a pass. That distinction is the point:
+this failure was survivable only because someone eventually looked, and a check
+that quietly reports success when it did no work is worse than no check.
+
+**What this does not establish about any image it passes.** Only that the canvas
+is not uniform. Not that it is the right picture, not that it is the right way
+up, not that it is not mostly empty. A person still has to look.
+
 ## What follows for building and migrating
 
 Body images that must be responsive belong in **image fields** rendered by

@@ -1,7 +1,7 @@
 {
   "name": "wf-cli",
   "version": "1.0.0",
-  "description": "wf \u2014 Webflow Data API operator CLI with per-workspace profiles and human-issued, time-boxed access grants",
+  "description": "wf — Webflow Data API operator CLI with per-workspace profiles and human-issued, time-boxed access grants",
   "type": "module",
   "repository": {
     "type": "git",
@@ -28,6 +28,7 @@
   "files": ["bin/", "lib/", "skill/", "README.md", "LICENSE"],
   "private": true,
   "dependencies": {
+    "@probeo/jsonld": "^0.1.0",
     "dotenv": "^17.4.2",
     "ms": "^2.1.3",
     "p-limit": "^7.3.1",

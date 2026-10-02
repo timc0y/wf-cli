@@ -61,7 +61,7 @@
 //      COSTS a visitor — host classification cannot see weight, so a page whose
 //      images are all correctly hosted can still ship megabytes. Read-only;
 //      --dry is refused.)
-//   wf images adopt <collectionId> --site <siteId> [--item <id>…] [--folder <name>] [--only-foreign] [--max-width 1600] [--no-avif] [--avif-quality 65] [--out plan.json] [--dry]
+//   wf images adopt <collectionId> --site <siteId> [--item <id>…] [--folder <name>] [--only-foreign] [--max-width 1600] [--no-avif] [--avif-quality 65] [--allow-uniform] [--skip-pixel-check] [--out plan.json] [--dry]
 //     (downloads each foreign source, converts it to AVIF, uploads it as a real
 //      site asset, then repoints the html at it. Always --dry first: it prints
 //      the per-image before/after sizes and writes nothing. A source that no
@@ -72,7 +72,11 @@
 //      full width, with the figure's max-width cap moved to the real file
 //      width — the cap is what decides rendered size, so both move together.
 //      --max-width comes from the LAYOUT, not the source file: measure the
-//      rendered width of the rich-text column and double it for retina.)
+//      rendered width of the rich-text column and double it for retina.
+//      Every converted file is DECODED and sampled before it is uploaded:
+//      a conversion that produced a correctly sized, correctly typed, empty
+//      image is refused and its item left alone. --allow-uniform permits a
+//      deliberate solid colour; --skip-pixel-check skips decoding.)
 //     (same-site links in CMS rich-text and link fields that are absolute,
 //      trailing-slashed, or off the canonical host. --check-targets reports each
 //      destination's status. Read-only: it never rewrites and never infers
@@ -85,6 +89,10 @@
 //   wf item publish <collId> <itemId…>                            bulk publish (danger; --confirm the id set)
 //   wf page-schema <pageId…> --site <siteId> [--locale <id>]      JSON-LD schema markup (beta)
 //   wf page-schema set <pageId…> --site <siteId> --file schema.json | --data '<json>' | --clear
+//   wf page-schema check --file schema.json | --data '<json>'     lint one document, send nothing
+//   wf page-schema audit --url https://site.webflow.io [--limit 50] [--json]
+//     (what a PUBLISHED site serves: every page's JSON-LD, its errors, and the
+//      pages carrying none. Public HTTP only — no grant, no Data API.)
 //     (--data/--file is the JSON-LD DOCUMENT for a page; with no page ids it is
 //      the endpoint's own {"pages":[{id, jsonLdSchema}]} bulk body. --site
 //      routes through the site-scoped bulk endpoints, which are the ones a
@@ -138,6 +146,7 @@ import { parseCliArgs } from "../lib/argv.mjs";
 import {
   DEFAULT_AVIF_QUALITY,
   DEFAULT_RICHTEXT_MAX_WIDTH,
+  IMAGE_EXT,
   SUPPORTED_EXT,
   buildExistingAssetIndex,
   cleanAssetName,
@@ -168,6 +177,8 @@ import { ENDPOINTS } from "../lib/endpoints.mjs";
 import { CODES } from "../lib/error-codes.mjs";
 import { buildFieldUpdateBatch, buildFieldUpdateBody, preflightFieldUpdateBatch, verifyFieldUpdate, verifyFieldUpdateBatch } from "../lib/fields.mjs";
 import { MS_PER_DAY, describeGrant, getGrant, isFailure, issueGrant, listGrants, readAudit, revokeAll, revokeGrant } from "../lib/grants.mjs";
+import { fetchWithTimeout } from "../lib/http-json.mjs";
+import { PIXEL_CHECK_STATUS, describePixelCheck, findDecoder, isPixelCheckBlocking, samplePixels } from "../lib/image-pixels.mjs";
 import { LINK_FIELD_TYPES, applyTargetStatus, auditLinks, listAllItems, normalizeHosts, renderLinkAudit, resolveTargets } from "../lib/links.mjs";
 import { offloadIfLarge } from "../lib/offload.mjs";
 import {
@@ -197,6 +208,7 @@ import {
   summariseWeight,
   verifyAdoptedImages
 } from "../lib/richtext-images.mjs";
+import { auditPage, auditSite, isSitemapIndex, lintSchemaDocument, renderSchemaAudit, sitemapUrls } from "../lib/schema-audit.mjs";
 import { BODY_CONTRACTS, contractFor, renderContract, validateBody } from "../lib/schemas.mjs";
 
 // ── argv ──────────────────────────────────────────────────────────────────────
@@ -231,6 +243,8 @@ const {
   flagResizeOversized,
   flagForce,
   flagConcurrency,
+  flagUrl,
+  flagLimit,
   flagAll,
   liveClientAccess,
   flagLocale,
@@ -262,6 +276,8 @@ const {
   flagAvifQuality,
   flagNoAvif,
   flagOnlyForeign,
+  flagAllowUniform,
+  flagSkipPixelCheck,
   flagMaxWidth,
   flagDomains
 } = parseCliArgs(process.argv.slice(2));
@@ -866,7 +882,10 @@ if (cmd === "call") {
 // batch conveniences a single `wf call assets create` doesn't have: skip
 // files already uploaded, fail fast on oversized files, resume a previous
 // run, resolve/create --folder by name, optionally downscale oversized
-// images. Source-agnostic — see the wf skill's asset docs for the
+// images, and — the only check here that reads the picture rather than the
+// container — decode every image and sample a grid of points before uploading,
+// so a file that is the right size and the right shape and blank does not
+// reach a client site. Source-agnostic — see the wf skill's asset docs for the
 // Figma-sourced recipe (Framelink download → this command).
 if (cmd === "assets") {
   const sub = (positionals[1] || "").toLowerCase();
@@ -939,6 +958,40 @@ if (cmd === "assets") {
       process.exit(1);
     }
 
+    // Pixel verification — the only check here that looks at the picture
+    // rather than the container. Everything above (byte count, cap, extension,
+    // md5) passed for four AVIFs on 2026-09-10 that decoded to solid black and
+    // reached a live site. Runs on the file that will ACTUALLY be uploaded, so
+    // a resized copy is checked rather than the source it came from, and runs
+    // before the first network call so a bad batch costs nothing.
+    const pixelByFile = new Map();
+    if (!flagSkipPixelCheck) {
+      const decoder = findDecoder();
+      const looked = checked.filter((one) => IMAGE_EXT.has(extname(one.uploadFile).toLowerCase()));
+      for (const one of looked) pixelByFile.set(one.uploadFile, samplePixels(one.uploadFile, { decoder }));
+
+      const unavailable = looked.filter((one) => pixelByFile.get(one.uploadFile).status === PIXEL_CHECK_STATUS.UNAVAILABLE);
+      if (unavailable.length) {
+        console.warn(`⚠ ${describePixelCheck(pixelByFile.get(unavailable[0].uploadFile))}`);
+        console.warn(
+          `  ${unavailable.length} image(s) will be uploaded without being decoded. Install ffmpeg to turn the check on, or pass --skip-pixel-check to record that you chose to skip it.`
+        );
+      }
+
+      const blocked = looked.filter((one) => isPixelCheckBlocking(pixelByFile.get(one.uploadFile), { allowUniform: flagAllowUniform }));
+      if (blocked.length) {
+        console.error(`✗ [${CODES.WF_IMAGE_PIXELS_EMPTY}] ${blocked.length} image(s) failed the pixel check — aborting before any uploads:`);
+        for (const one of blocked) {
+          console.error(`  - ${one.originalFile}${one.uploadFile === one.originalFile ? "" : ` (as ${basename(one.uploadFile)})`}`);
+          console.error(`    ${describePixelCheck(pixelByFile.get(one.uploadFile))}`);
+        }
+        console.error(
+          "  A deliberate solid-colour file is legitimate: re-run with --allow-uniform to upload a uniform canvas anyway. --skip-pixel-check skips decoding entirely."
+        );
+        process.exit(1);
+      }
+    }
+
     const folderResult = await resolveOrCreateFolder({ profile, siteId: flagSite, folderNameOrId: flagFolder, dryRun, project });
     if (!folderResult.ok) die(folderResult.error);
     if (folderResult.created) console.log(`Created asset folder "${flagFolder}" (${folderResult.folderId}).`);
@@ -973,13 +1026,25 @@ if (cmd === "assets") {
         limit(async () => {
           if (item.skip) {
             console.log(`[${idx + 1}/${items.length}] ${item.originalFile} — already uploaded, skipping (${item.skipReason})`);
-            results[idx] = { file: item.originalFile, ok: true, skipped: true, reason: item.skipReason, assetId: item.existingAssetId };
+            results[idx] = {
+              file: item.originalFile,
+              ok: true,
+              skipped: true,
+              reason: item.skipReason,
+              pixelCheck: pixelByFile.get(item.uploadFile)?.status ?? "not-checked",
+              assetId: item.existingAssetId
+            };
             return;
           }
           const label = item.resized ? `${item.originalFile} (resized copy)` : item.originalFile;
           process.stdout.write(`[${idx + 1}/${items.length}] uploading ${label} ... `);
           const result = await uploadAssetFile({ profile, siteId: flagSite, filePath: item.uploadFile, folderId: folderResult.folderId, dryRun, project });
-          results[idx] = { file: item.originalFile, resized: item.resized || undefined, ...result };
+          results[idx] = {
+            file: item.originalFile,
+            resized: item.resized || undefined,
+            pixelCheck: pixelByFile.get(item.uploadFile)?.status ?? "not-checked",
+            ...result
+          };
           console.log(result.ok ? (result.dryRun ? "dry-run ok" : `ok (${result.assetId || "?"})`) : `FAILED: ${result.error}`);
         })
       )
@@ -1020,11 +1085,89 @@ if (cmd === "assets") {
 //   wf page-schema <pageId…>          [--site <id>] [--locale <id>]   read
 //   wf page-schema --pages <id,id,…>   --site <id>  [--locale <id>]   read (≤100)
 //   wf page-schema set <pageId…> --site <id> (--data <json>|--file <f>|--clear) [--locale <id>]
+//   wf page-schema check (--data <json>|--file <f>)                   lint only, sends nothing
+//   wf page-schema audit --url <base> [--limit N] [--json]            audit a published site
 //   wf page-schema set --site <id> --file <bulk.json>                 write (≤25 entries)
 //
 // --data/--file for a single page is the JSON-LD DOCUMENT itself, not the
 // request envelope. For the bulk file form it is the endpoint's own
 // {pages:[{id, jsonLdSchema, localeId?}]} body (or just that array).
+// `wf page-schema audit` — what a published site actually serves to Google.
+//
+// This reads public pages over plain HTTP: no Data API, no grant, nothing that
+// can touch a site. The base URL is given, never resolved from a site id, so
+// the command cannot reach a client's data by accident.
+if (cmd === "page-schema" && positionals[1] === "audit") {
+  const base = flagUrl || positionals[2];
+  if (!base)
+    die(
+      "Usage: wf page-schema audit --url https://site.webflow.io [--limit 50] [--json]",
+      "The staging host works and needs no grant; a custom domain may be gated by its CDN."
+    );
+  let origin;
+  try {
+    origin = new URL(base.startsWith("http") ? base : `https://${base}`).origin;
+  } catch {
+    die(`--url ${JSON.stringify(base)} is not a URL.`);
+  }
+  const cap = Number.isFinite(flagLimit) && flagLimit > 0 ? flagLimit : 50;
+
+  const read = async (url) => {
+    try {
+      const response = await fetchWithTimeout(url, { headers: { accept: "text/html,application/xhtml+xml,application/xml" } }, { timeoutMs: 15_000 });
+      return { status: response.status, body: response.status === 200 ? await response.text() : "" };
+    } catch (error) {
+      // Never let a programming error read as a network result.
+      if (error instanceof ReferenceError || error instanceof TypeError) throw error;
+      return { status: 0, body: "", error: error?.message || "fetch failed" };
+    }
+  };
+
+  if (!flagJson) console.error(`… reading ${origin}/sitemap.xml`);
+  const index = await read(`${origin}/sitemap.xml`);
+  if (index.status !== 200)
+    die(`${origin}/sitemap.xml answered ${index.status || "no response"}.`, "Webflow publishes one for every site; a 404 usually means the wrong host.");
+  let urls = sitemapUrls(index.body);
+  if (isSitemapIndex(index.body)) {
+    const nested = [];
+    for (const child of urls.slice(0, 10)) {
+      const answer = await read(child);
+      if (answer.status === 200) nested.push(...sitemapUrls(answer.body));
+    }
+    urls = nested;
+  }
+  urls = [...new Set(urls)].slice(0, cap);
+  if (!urls.length) die("The sitemap listed no page URLs.");
+
+  if (!flagJson) console.error(`… checking ${urls.length} page(s)`);
+  const limit = pLimit(6);
+  const pages = await Promise.all(
+    urls.map((url) =>
+      limit(async () => {
+        const answer = await read(url);
+        return auditPage({ url, html: answer.body, status: answer.status });
+      })
+    )
+  );
+  const report = auditSite(pages);
+  console.log(flagJson ? JSON.stringify(report, null, 2) : renderSchemaAudit(report));
+  process.exit(report.counts.errors ? 1 : 0);
+}
+
+// `wf page-schema check` — lint a document without sending it anywhere.
+if (cmd === "page-schema" && positionals[1] === "check") {
+  const document = bodyFromFlags();
+  if (document === undefined) die("wf page-schema check needs the document: --file <path> or --data '<json>'.");
+  const verdict = lintSchemaDocument(document);
+  if (flagJson) console.log(JSON.stringify(verdict, null, 2));
+  else {
+    for (const entry of verdict.issues) console.log(`[${entry.severity}] ${entry.path}: ${entry.message}`);
+    console.log(verdict.issues.length ? "" : "No issues.");
+    console.log(verdict.valid ? "✓ Webflow will accept this and Google can use it." : "✗ Not writable as-is.");
+  }
+  process.exit(verdict.valid ? 0 : 1);
+}
+
 if (cmd === "page-schema") {
   const setting = (positionals[1] || "").toLowerCase() === "set";
   const ids = [...positionals.slice(setting ? 2 : 1), ...(flagPages || [])];
@@ -1070,6 +1213,22 @@ if (cmd === "page-schema") {
   // A write. `--clear` is jsonLdSchema: null; otherwise the parsed JSON is the
   // JSON-LD document (an object, or a string of raw/script-wrapped JSON).
   const jsonLd = flagClear ? null : bodyFromFlags();
+
+  // Refuse before the PUT what Webflow or Google would reject after it: the
+  // documented write limits, and the required fields for the rich result the
+  // type asks for. `--force` exists because this gate is a copy of someone
+  // else's rules and must never be the reason a correct document cannot ship.
+  if (!flagClear) {
+    const verdict = lintSchemaDocument(jsonLd);
+    for (const entry of verdict.issues.filter((found) => found.severity === "error")) console.error(`✗ ${entry.path}: ${entry.message}`);
+    for (const entry of verdict.issues.filter((found) => found.severity === "warning")) console.error(`! ${entry.path}: ${entry.message}`);
+    if (!verdict.valid && !flagForce) {
+      die(
+        "The schema markup was not sent because it would be rejected or ignored.",
+        "Fix the errors above, run `wf page-schema check --file <f>`, or pass --force to send it anyway."
+      );
+    }
+  }
 
   if (bulkFile) {
     const entries = Array.isArray(jsonLd) ? jsonLd : jsonLd?.pages;
@@ -1689,7 +1848,7 @@ if (cmd === "images" && positionals[1] === "audit") {
 if (cmd === "images" && positionals[1] === "adopt") {
   const collectionId = positionals[2];
   const usage =
-    "Usage: wf images adopt <collectionId> --site <siteId> [--item <id>…] [--folder <name>] [--no-avif] [--avif-quality 65] [--out plan.json] [--dry]";
+    "Usage: wf images adopt <collectionId> --site <siteId> [--item <id>…] [--folder <name>] [--no-avif] [--avif-quality 65] [--allow-uniform] [--skip-pixel-check] [--out plan.json] [--dry]";
   if (!collectionId) die(usage);
   if (!flagSite) die("wf images adopt requires --site <siteId> — the asset upload is a site-level call.", usage);
   const pinError = checkSitePin(project, `sites/${flagSite}/assets`);
@@ -1761,6 +1920,8 @@ if (cmd === "images" && positionals[1] === "adopt") {
     const widthByUrl = new Map();
     const unresolved = [];
     const prepared = [];
+    // Probed once for the whole run rather than once per image.
+    const pixelDecoder = flagSkipPixelCheck ? null : findDecoder();
     const limit = pLimit(Math.max(1, Number(flagConcurrency) || 4));
     await Promise.all(
       plan.sources.map((src) =>
@@ -1771,17 +1932,59 @@ if (cmd === "images" && positionals[1] === "adopt") {
             return;
           }
           const ready = prepareImageForUpload(got.file, tmpRoot, { avif: !flagNoAvif, quality, maxWidth });
-          prepared.push({ src, ...got, ...ready, displayName: cleanAssetName(basename(ready.uploadFile)) });
+          // This command converts the file itself, so it can manufacture the
+          // exact defect the check exists for: a source that was fine going
+          // in, and an AVIF that decodes to nothing coming out. Check the
+          // converted file, not the download.
+          const pixels = flagSkipPixelCheck ? null : samplePixels(ready.uploadFile, { decoder: pixelDecoder });
+          prepared.push({ src, ...got, ...ready, pixels, displayName: cleanAssetName(basename(ready.uploadFile)) });
         })
       )
     );
+
+    // Refuse an empty conversion before either path continues: --dry has to
+    // report it (that is what --dry is for) and the live path has to leave the
+    // source alone rather than repoint an item at a blank image. Removed from
+    // `prepared`, so it is never uploaded and never spliced; the original url
+    // stays in the html, which is still the only record of what the image was.
+    const pixelFailures = [];
+    for (let i = prepared.length - 1; i >= 0; i--) {
+      const one = prepared[i];
+      if (!one.pixels || !isPixelCheckBlocking(one.pixels, { allowUniform: flagAllowUniform })) continue;
+      pixelFailures.unshift(one);
+      prepared.splice(i, 1);
+      unresolved.push({
+        src: one.src,
+        error: one.pixels.status === PIXEL_CHECK_STATUS.UNIFORM ? `pixel check: 1 unique of ${one.pixels.total}` : "pixel check: would not decode",
+        errorCode: CODES.WF_IMAGE_PIXELS_EMPTY
+      });
+    }
+    const pixelUnavailable = prepared.filter((one) => one.pixels?.status === PIXEL_CHECK_STATUS.UNAVAILABLE);
+    if (pixelUnavailable.length) {
+      console.warn(`⚠ ${describePixelCheck(pixelUnavailable[0].pixels)}`);
+      console.warn(
+        `  ${pixelUnavailable.length} converted image(s) are unverified. Install ffmpeg to turn the check on, or pass --skip-pixel-check to record that you chose to skip it.`
+      );
+    }
+    if (pixelFailures.length) {
+      console.error(
+        `✗ [${CODES.WF_IMAGE_PIXELS_EMPTY}] ${pixelFailures.length} image(s) failed the pixel check after conversion — not uploaded, and their items are left untouched:`
+      );
+      for (const one of pixelFailures) {
+        console.error(`  - ${one.src}`);
+        console.error(`    ${describePixelCheck(one.pixels)}`);
+      }
+      console.error(
+        "  Re-run with --no-avif to adopt the source untouched, --allow-uniform if the flat colour is deliberate, or --skip-pixel-check to skip decoding."
+      );
+    }
 
     if (dryRun) {
       console.log(renderAdoptionPlan(plan, { unresolved }));
       console.log("");
       for (const one of prepared)
         console.log(
-          `  ${one.displayName.slice(0, 46).padEnd(48)} ${(one.originalSize / 1024).toFixed(0).padStart(7)}KB -> ${(one.finalSize / 1024).toFixed(0).padStart(7)}KB  ${String(one.originalWidth ?? "?").padStart(5)}px -> ${String(one.finalWidth ?? "?").padStart(5)}px${one.converted ? " avif" : ""}${one.resized ? " resized" : ""}${one.overCap ? "  STILL OVER CAP, would be skipped" : ""}`
+          `  ${one.displayName.slice(0, 46).padEnd(48)} ${(one.originalSize / 1024).toFixed(0).padStart(7)}KB -> ${(one.finalSize / 1024).toFixed(0).padStart(7)}KB  ${String(one.originalWidth ?? "?").padStart(5)}px -> ${String(one.finalWidth ?? "?").padStart(5)}px${one.converted ? " avif" : ""}${one.resized ? " resized" : ""}${one.pixels ? `  ${one.pixels.unique ?? 0}/${one.pixels.total} unique` : "  pixels unchecked"}${one.overCap ? "  STILL OVER CAP, would be skipped" : ""}`
         );
       console.log("\n--dry: nothing uploaded, nothing written.");
       process.exit(0);
