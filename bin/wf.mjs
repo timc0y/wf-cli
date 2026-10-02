@@ -112,6 +112,12 @@
 //     (edit the --json output and send it back: pages match by path or id,
 //      only changed fields are sent, 100 per bulk call (beta), each change is
 //      printed old → new, and a slug the API would silently ignore is refused.)
+//   wf redirects <siteId> [--json]                               301 rules in the order they run, then problems
+//   wf redirects check [<siteId>] [--file new.json] [--url https://<site>]
+//   wf redirects add <siteId> --file new.json [--url https://<site>] [--dry] [--force]
+//   wf redirects test --url https://<site> (--file old-urls.txt | --sitemap <old sitemap>)
+//     (`wf help redirects` is the full guide: escaping, order, live pages,
+//      chains, domains, limits and a migration process.)
 //   wf publish <siteId> [--domains a.com,b.com | --subdomain] --confirm <siteId>
 //     (defaults to EVERY custom domain plus the webflow.io subdomain, and always
 //      prints what it published to. Publishing only the subdomain leaves the
@@ -214,6 +220,7 @@ import {
   validateProfileName
 } from "../lib/profiles.mjs";
 import { checkSitePin, findProjectConfig, resolveProfile } from "../lib/project.mjs";
+import { REDIRECTS_GUIDE, checkRules, followLive, judgeFollow, parseRules, renderFindings } from "../lib/redirects.mjs";
 import { renderAuditBloat, renderAuditFails, renderAuditReport, renderAuditTail } from "../lib/reporting.mjs";
 import {
   IMAGE_HTML_FIELD_TYPES,
@@ -299,7 +306,8 @@ const {
   flagMaxWidth,
   flagDomains,
   flagFamily,
-  flagDisplay
+  flagDisplay,
+  flagSitemap
 } = parseCliArgs(process.argv.slice(2));
 
 if (liveClientAccess) {
@@ -414,6 +422,10 @@ const AGENT_CONTRACT = `wf — agent contract (the CLI enforces all of this; you
 if (!cmd || ["help", "-h", "--help"].includes(cmd)) {
   if (positionals[1] === "agents") {
     console.log(AGENT_CONTRACT);
+    process.exit(0);
+  }
+  if (positionals[1] === "redirects") {
+    console.log(REDIRECTS_GUIDE);
     process.exit(0);
   }
   help();
@@ -2645,6 +2657,192 @@ if (cmd === "item" && positionals[1] === "publish") {
       "Publishes staged items to live. Danger tier (--write --danger) and --confirm the whole id set — run it with --dry first; the preview prints the exact --confirm string."
     );
   await run({ method: "POST", path: `collections/${collectionId}/items/publish`, body: { itemIds } });
+}
+
+// `wf redirects` — 301 rules, read in the order Webflow runs them and checked
+// for the mistakes that make a rule silently do nothing or hide a live page.
+// `wf help redirects` is the guide; lib/redirects.mjs holds the model.
+if (cmd === "redirects") {
+  const sub = ["check", "add", "test"].includes(positionals[1]) ? positionals[1] : "list";
+  const siteId = sub === "list" ? positionals[1] : positionals[2];
+
+  // Every path that serves a page right now, from a public sitemap.
+  const sitemapPaths = async (sitemapUrl) => {
+    const read = async (url) => {
+      try {
+        const response = await fetchWithTimeout(url, { headers: { accept: "application/xml,text/xml" } }, { timeoutMs: 15_000 });
+        return response.status === 200 ? await response.text() : null;
+      } catch (error) {
+        if (error instanceof ReferenceError || error instanceof TypeError) throw error;
+        return null;
+      }
+    };
+    const xml = await read(sitemapUrl);
+    if (xml == null) die(`${sitemapUrl} could not be read.`, "Use the site's own host; Webflow publishes /sitemap.xml for every site.");
+    let urls = sitemapUrls(xml);
+    if (isSitemapIndex(xml)) {
+      const nested = [];
+      for (const child of urls.slice(0, 20)) nested.push(...sitemapUrls((await read(child)) || ""));
+      urls = nested;
+    }
+    return [...new Set(urls)];
+  };
+  const originOf = (raw) => {
+    try {
+      return new URL(raw).origin;
+    } catch {
+      die(`--url ${JSON.stringify(raw)} is not a URL.`);
+    }
+  };
+
+  if (sub === "test") {
+    if (!flagUrl) die("Usage: wf redirects test --url https://www.example.com (--file old-urls.txt | --sitemap <old sitemap url>) [--json]");
+    const origin = originOf(flagUrl);
+    let paths = [];
+    if (flagSitemap) paths = (await sitemapPaths(flagSitemap)).map((url) => new URL(url).pathname + new URL(url).search);
+    if (file) {
+      const raw = readFileSync(resolve(process.cwd(), file), "utf8");
+      let parsed = null;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {}
+      const rules = parsed ? parseRules(parsed) : null;
+      const lines = rules
+        ? rules
+            .map((rule) => rule.fromUrl)
+            .filter((from) => from && !from.includes("(.*)"))
+            .map((from) => from.replace(/%(.)/g, "$1"))
+        : Array.isArray(parsed)
+          ? parsed
+          : raw.split(/\r?\n/);
+      paths.push(...lines.map((line) => String(line).trim()).filter(Boolean));
+    }
+    paths = [...new Set(paths.map((one) => (/^https?:/i.test(one) ? new URL(one).pathname + new URL(one).search : one)))];
+    if (!paths.length) die("No old URLs to follow — pass --file (one path or URL per line, or a rules JSON) or --sitemap.");
+    if (!flagJson) console.error(`… following ${paths.length} URL(s) on ${origin}`);
+    const limit = pLimit(6);
+    const results = await Promise.all(paths.map((path) => limit(async () => ({ ...(await followLive(`${origin}${path}`)), verdict: null }))));
+    for (const result of results) result.verdict = judgeFollow(result);
+    if (flagJson) out({ ok: true, data: results }, { path: "redirects-test", method: "GET" });
+    const bad = results.filter((result) => !["OK", "NO_REDIRECT"].includes(result.verdict));
+    for (const result of results) {
+      const chain = result.hops.map((hop) => `${hop.status} ${hop.to}`).join("  →  ");
+      const mark = result.verdict === "OK" ? "✓" : result.verdict === "NO_REDIRECT" ? "=" : "✗";
+      console.log(`${mark} ${result.verdict.padEnd(15)} ${new URL(result.url).pathname}${chain ? `  →  ${chain}` : ""}  [${result.status || result.error}]`);
+    }
+    const tally = {};
+    for (const result of results) tally[result.verdict] = (tally[result.verdict] || 0) + 1;
+    const counts = Object.entries(tally).map(([verdict, n]) => `${n} ${verdict}`);
+    console.log(`\n${counts.join(", ")}. "=" serves a page at the old URL with no redirect.`);
+    process.exit(bad.length ? 1 : 0);
+  }
+
+  const readRules = async () => {
+    const all = [];
+    for (let offset = 0; ; offset += 100) {
+      const res = await webflowRequest({ profile, method: "GET", path: `sites/${siteId}/redirects`, query: { limit: 100, offset }, project });
+      if (!res.ok) out(res, { path: `sites/${siteId}/redirects`, method: "GET" });
+      const batch = Array.isArray(res.data?.redirects) ? res.data.redirects : [];
+      all.push(...batch);
+      if (batch.length < 100) break;
+    }
+    return all;
+  };
+  // Live pages: the public sitemap when --url is given (static and CMS pages),
+  // otherwise the site's static pages from the Data API.
+  const livePaths = async () => {
+    if (flagUrl) return (await sitemapPaths(`${originOf(flagUrl)}/sitemap.xml`)).map((url) => new URL(url).pathname);
+    if (!siteId) return [];
+    const res = await webflowRequest({ profile, method: "GET", path: `sites/${siteId}/pages`, query: { limit: 100 }, project });
+    if (!res.ok) return [];
+    console.error("! Checked against static pages only — pass --url https://<site> to include CMS item pages.");
+    return (res.data?.pages || [])
+      .filter((page) => !page.draft && !page.archived && !page.collectionId && page.publishedPath)
+      .map((page) => page.publishedPath);
+  };
+
+  let proposed = [];
+  if (sub !== "list") {
+    const parsed = bodyFromFlags();
+    if (parsed === undefined && sub !== "check")
+      die(`wf redirects ${sub} needs --file rules.json (or --data).`, 'rules.json: [{ "fromUrl": "/old", "toUrl": "/new" }]');
+    if (parsed !== undefined) {
+      proposed = parseRules(parsed);
+      if (!proposed) die('The rules file must be [{ "fromUrl", "toUrl" }] (or { "redirects": [...] }).');
+      const blank = proposed.findIndex((rule) => !rule.fromUrl || !rule.toUrl);
+      if (blank >= 0) die(`Rule ${blank + 1} needs both fromUrl and toUrl.`);
+    }
+    if (sub === "add" && !siteId) die("Usage: wf redirects add <siteId> --file rules.json [--url https://<site>] [--dry] [--force]");
+    if (sub === "check" && !siteId && !proposed.length) die("Usage: wf redirects check [<siteId>] [--file rules.json] [--url https://<site>]");
+  } else if (!siteId) {
+    die("Usage: wf redirects <siteId> [--json] | wf redirects check|add|test …", "wf help redirects — the guide.");
+  }
+
+  const existing = siteId ? await readRules() : [];
+  const rules = [...existing, ...proposed];
+  const findings = checkRules(rules, { livePaths: await livePaths(), firstNew: existing.length });
+
+  if (sub === "list") {
+    if (flagJson) out({ ok: true, data: { redirects: existing, findings } }, { path: `sites/${siteId}/redirects`, method: "GET" });
+    existing.forEach((rule, i) => console.log(`${String(i + 1).padStart(4)}  ${rule.fromUrl}  →  ${rule.toUrl}`));
+    console.log(`\n${existing.length} rule(s), in the order Webflow runs them (oldest first).\n`);
+    console.log(renderFindings(findings));
+    process.exit(0);
+  }
+
+  console.log(renderFindings(findings));
+  const blocking = findings.filter((f) => f.level === "error");
+  if (sub === "check") {
+    console.log(`\n${existing.length} existing + ${proposed.length} proposed rule(s); ${blocking.length} problem(s) in the proposed rules. Nothing was sent.`);
+    process.exit(blocking.length ? 1 : 0);
+  }
+
+  // add
+  if (blocking.length && !flagForce) {
+    console.error(
+      `\n✗ [${CODES.WF_REDIRECT_CHECK}] ${blocking.length} proposed rule(s) would not work as written — nothing was sent. Fix them, or --force to create them anyway.`
+    );
+    process.exit(1);
+  }
+  if (!dryRun) {
+    const grant = getGrant(profile);
+    const left = grant?.maxCalls == null ? Number.POSITIVE_INFINITY : grant.maxCalls - (grant.callsUsed || 0);
+    if (left < proposed.length + 1)
+      die(
+        `[${CODES.WF_BUDGET_EXHAUSTED}] ${proposed.length} rule(s) need ${proposed.length + 1} calls (one create each, plus a read-back) but the grant has ${left} left.`,
+        `Ask the human for:  wf grant ${profile} --site ${siteId} --write --max-calls ${proposed.length + 10} --ttl 15m   — or split the file.`
+      );
+  }
+  const created = [];
+  for (const [index, rule] of proposed.entries()) {
+    const res = await request({ method: "POST", path: `sites/${siteId}/redirects`, body: { fromUrl: rule.fromUrl, toUrl: rule.toUrl } });
+    if (res.dryRun) {
+      if (index === 0) console.log(`\n--dry: ${proposed.length} POST /sites/${siteId}/redirects, one per rule, in file order. First:`);
+      if (index === 0) console.log(JSON.stringify(res.data.wouldSend, null, 2));
+      continue;
+    }
+    if (!res.ok)
+      out(
+        {
+          ...res,
+          error: `Rule ${index + 1} (${rule.fromUrl}) failed after ${created.length} were created: ${res.error}`,
+          details: { created, remaining: proposed.slice(index) }
+        },
+        { path: `sites/${siteId}/redirects`, method: "POST" }
+      );
+    created.push(res.data);
+  }
+  if (dryRun) process.exit(0);
+  const after = await readRules();
+  const tail = after.slice(-proposed.length).map((rule) => `${rule.fromUrl}→${rule.toUrl}`);
+  const inOrder = proposed.every((rule, i) => tail[i] === `${rule.fromUrl}→${rule.toUrl}`);
+  console.log(
+    inOrder
+      ? `\n✓ ${created.length} rule(s) created, and they read back at the end of the list in file order.`
+      : `\n! ${created.length} rule(s) created, but the read-back does not show them at the end in file order — run \`wf redirects ${siteId}\` to see the real order.`
+  );
+  console.log("They do nothing until the site is published. After publishing: wf redirects test --url https://<site> --file <this file>");
+  process.exit(inOrder ? 0 : 1);
 }
 
 const shortcuts = {

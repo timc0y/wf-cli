@@ -114,6 +114,9 @@ result. A successful HTTP response alone is not completion.
     wf links audit <siteId> --hosts a.com,www.a.com [--canonical www.a.com]   # same-site link hygiene
     wf images audit <siteId> --check-targets       # rich-text images: host AND weight per item
     wf publish <siteId> --confirm <siteId>         # every custom domain, not just staging
+    wf redirects <siteId>                          # 301 rules in the order they run, then problems
+    wf redirects check <siteId> --file new.json --url https://<site>   # before adding any
+    wf redirects test --url https://<site> --sitemap <old sitemap>     # after publishing
     wf images adopt <collId> --site <id> --dry     # bring them in as real assets, as AVIF
     wf components used <siteId>                    # components placed inside rich-text fields
     wf components migrate <siteId> --from <id> --to <id> --dry   # swap one for another
@@ -263,6 +266,13 @@ upload` for custom fonts.
 
 Read [references/assets.md](references/assets.md) for the options and the Figma
 asset workflow.
+
+## Redirects
+
+Run `wf help redirects` before writing any 301 rule. It is the guide: wildcard
+escaping, the oldest-first order that new rules cannot jump, rules that hide
+live pages, chains, domains, limits and a migration process. Use `wf redirects
+check` before `wf redirects add`, and `wf redirects test` after publishing.
 
 ## Check what happened
 
