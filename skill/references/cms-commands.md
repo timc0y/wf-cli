@@ -9,6 +9,7 @@ wf fields add <collId> --type Reference --name Author --to <targetCollId>
 wf fields add <collId> --type Option --name Status --options draft,live
 wf fields update <collId> <fieldId> --name "Editorial summary" --help-text "Shown to editors" --is-required false
 wf fields update <collId> --file field-updates.json
+wf collections groups <collId> --file groups.json
 wf items set <collId> <itemId> --set name=Acme --set slug=acme-ltd
 wf items set <collId> <itemId> --draft true --archived false
 wf item publish <collId> <itemId…>
@@ -19,6 +20,7 @@ wf item publish <collId> <itemId…>
 - Read collection fields
 - Audit help-text coverage across a site
 - Update field metadata
+- Group fields
 - Edit an item
 - Add a field
 - Publish items
@@ -89,8 +91,23 @@ Use `--check` to validate the manifest and PATCH contracts locally, then
 run performs the current-state preflight. Rename into an occupied label in a
 separate verified batch using a unique temporary label first.
 
-CMS field groups and within-group order are Designer-only concepts. Use the
-Designer tooling for those; do not try to represent them through the Data API.
+## Group fields
+
+`wf collections groups <collId>` lists the field groups. With `--file` it
+replaces them through `PATCH /collections/{id}`, which takes field ids and
+replaces every group at once. The file names fields by slug:
+
+```json
+{ "SEO": ["meta-title", "meta-description"], "Hero": ["hero-image"] }
+```
+
+The list form `[{ "name", "fields", "description" }]` adds descriptions; `{}`
+removes every group. The command refuses a missing or ambiguous field, a field
+in two groups, a repeated or over-long name, and more than 50 groups. It prints
+the groups before and after, names any group the write removes, and ends with
+a fresh readback. `--check` and `--dry` still read the collection, because the
+slugs resolve against it. Ecommerce collections do not take groups. Field order
+outside a group is still Designer-only.
 
 ## Edit an item
 

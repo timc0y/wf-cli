@@ -2,7 +2,8 @@
 name: wf-cli
 description: >-
   Use the `wf` CLI to read or change Webflow CMS data and site settings. Use for
-  collections, fields, items, pages, SEO data, assets, forms, redirects,
+  collections, fields, CMS field groups, items, pages, SEO data, assets, custom
+  fonts, forms, redirects,
   localisation, CMS item publishing, auditing internal links or rich-text images
   left inside CMS content by a migration, bringing those images in as real site
   assets, finding or swapping components placed inside rich-text fields, or
@@ -99,12 +100,15 @@ result. A successful HTTP response alone is not completion.
     wf call items create-item --p collection_id=<id> --data '{"fieldData":{…}}' --check
     wf call items create-item --p collection_id=<id> --data '{"fieldData":{…}}' --dry
     wf call items create-item --p collection_id=<id> --data '{"fieldData":{…}}'
+    wf pages meta <siteId> --json > meta.json        # titles, slugs, SEO, Open Graph
+    wf pages meta set <siteId> --file meta.json --dry   # write back only what changed
     wf page-schema <pageId…> --site <id>            # read JSON-LD schema markup (beta)
     wf page-schema set <pageId> --site <id> --file schema.json   # replace it
     wf fields <collectionId>                       # field table: id | slug | type | required | displayName
     wf fields <collectionId> --json                # complete field metadata, including help text
     wf fields add <collId> --type Reference --name Author --to <targetCollId>
     wf fields update <collId> <fieldId> --name "Editorial summary" --is-required false
+    wf collections groups <collId> --file groups.json --dry   # CMS field groups from slugs
     wf items set <collId> <itemId> --set slug=value    # typed CMS item write
     wf item publish <collId> <itemId…>             # bulk publish
     wf links audit <siteId> --hosts a.com,www.a.com [--canonical www.a.com]   # same-site link hygiene
@@ -115,6 +119,7 @@ result. A successful HTTP response alone is not completion.
     wf components migrate <siteId> --from <id> --to <id> --dry   # swap one for another
     wf audit report                # what happened lately
     wf assets upload <file...> --site <id> [--dir <path>] [--folder <name>] --dry
+    wf fonts upload <file...> --site <id> [--family <name>] --dry   # metadata read from the files
 
 Profile selection: `--profile <name>` > `WF_PROFILE` > `.wf.json` in the repo.
 New client repo? Ask the human to run `wf init` in it once.
@@ -253,7 +258,8 @@ value rules and publishing checks.
 ## Upload assets
 
 Use `wf assets upload` for local files or a folder. It checks duplicates and
-file sizes before uploading, and it can resume a failed batch.
+file sizes before uploading, and it can resume a failed batch. Use `wf fonts
+upload` for custom fonts.
 
 Read [references/assets.md](references/assets.md) for the options and the Figma
 asset workflow.

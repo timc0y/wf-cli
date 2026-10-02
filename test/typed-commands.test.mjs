@@ -336,3 +336,36 @@ describe("no access gate loosened: publish/live paths still need exactly what th
     assert.equal(res.errorCode, CODES.WF_NO_GRANT);
   });
 });
+
+describe("endpoints added from the 2026-09 spec — catalogued, priced and gated", () => {
+  const { tierForRequest, confirmationTargetFor } = grants;
+  it("resolves each one by name with its method and path", () => {
+    const table = [
+      ["collections", "update", "PATCH", "/collections/{collection_id}"],
+      ["custom_fonts", "batchCreate", "POST", "/sites/{site_id}/custom_fonts/batchCreate"],
+      ["llms", "get", "GET", "/beta/sites/{site_id}/llms_txt"],
+      ["llms", "patch", "PATCH", "/beta/sites/{site_id}/llms_txt"],
+      ["llms", "delete", "DELETE", "/beta/sites/{site_id}/llms_txt"],
+      ["pages", "update-page-settings-bulk", "PATCH", "/beta/pages"]
+    ];
+    for (const [group, name, method, path] of table) {
+      const ep = resolveCallEndpoint(group, name, { collection_id: COLLECTION, site_id: SITE_A });
+      assert.ok(ep, `${group}/${name} is missing`);
+      assert.deepEqual([ep.method, ep.path], [method, path]);
+    }
+  });
+
+  it("needs write for the writes and danger plus --confirm llms_txt for the delete", () => {
+    assert.equal(tierForRequest("PATCH", `collections/${COLLECTION}`), "write");
+    assert.equal(tierForRequest("POST", `sites/${SITE_A}/custom_fonts/batchCreate`), "write");
+    assert.equal(tierForRequest("PATCH", "beta/pages"), "write");
+    assert.equal(tierForRequest("DELETE", `beta/sites/${SITE_A}/llms_txt`), "danger");
+    assert.equal(confirmationTargetFor("DELETE", `beta/sites/${SITE_A}/llms_txt`), "llms_txt");
+  });
+
+  it("checks the llms.txt and bulk page bodies", () => {
+    assert.match(validateBody({ contract: contractFor("llms", "patch"), body: {} }).errors.join(" "), /fileData/);
+    const pages = Array.from({ length: 101 }, () => ({ id: ITEM }));
+    assert.match(validateBody({ contract: contractFor("pages", "update-page-settings-bulk"), body: { pages } }).errors.join(" "), /at most 100/);
+  });
+});

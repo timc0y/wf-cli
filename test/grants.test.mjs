@@ -501,6 +501,53 @@ describe("page -> site scoping (closes the pages/{page_id} URL gap)", () => {
   });
 });
 
+describe("bulk page metadata (PATCH /beta/pages) — targets live in the body", () => {
+  beforeEach(() => grants.revokeAll());
+  const PAGE_A = "eeeeeeeeeeeeeeeeeeeeeeee";
+  const PAGE_B = "999999999999999999999999";
+  const PAGE_UNKNOWN = "ffffffffffffffffffffffff";
+  const bulk = (...ids) => ({ pages: ids.map((id) => ({ id, title: "t" })) });
+
+  it("allows the write when every page is cached to an allowed site", () => {
+    profiles.setToken("bulkpages", "tok_1234567890abcdefghij", { preferFile: true });
+    profiles.cachePages("bulkpages", SITE_A, [{ id: PAGE_A }]);
+    grants.issueGrant({ profile: "bulkpages", tier: "write", ttlMs: 60_000, siteIds: [SITE_A] });
+    assert.equal(grants.authorize({ profile: "bulkpages", method: "PATCH", path: "beta/pages", body: bulk(PAGE_A) }).ok, true);
+  });
+
+  it("refuses when one page in the batch belongs to another site", () => {
+    profiles.setToken("bulkpages", "tok_1234567890abcdefghij", { preferFile: true });
+    profiles.cachePages("bulkpages", SITE_A, [{ id: PAGE_A }]);
+    profiles.cachePages("bulkpages", SITE_B, [{ id: PAGE_B }]);
+    grants.issueGrant({ profile: "bulkpages", tier: "write", ttlMs: 60_000, siteIds: [SITE_A] });
+    const res = grants.authorize({ profile: "bulkpages", method: "PATCH", path: "beta/pages", body: bulk(PAGE_A, PAGE_B) });
+    assert.equal(res.ok, false);
+    assert.match(res.error, new RegExp(`page ${PAGE_B}, which belongs to a different site`));
+  });
+
+  it("refuses an uncached page and a body with no usable ids", () => {
+    profiles.setToken("bulkpages", "tok_1234567890abcdefghij", { preferFile: true });
+    profiles.cachePages("bulkpages", SITE_A, [{ id: PAGE_A }]);
+    grants.issueGrant({ profile: "bulkpages", tier: "write", ttlMs: 60_000, siteIds: [SITE_A] });
+    assert.match(grants.authorize({ profile: "bulkpages", method: "PATCH", path: "beta/pages", body: bulk(PAGE_A, PAGE_UNKNOWN) }).error, /site-scoping cache/);
+    for (const body of [null, {}, { pages: [] }, { pages: [{ title: "no id" }] }]) {
+      const res = grants.authorize({ profile: "bulkpages", method: "PATCH", path: "beta/pages", body });
+      assert.equal(res.ok, false);
+      assert.match(res.error, /carries its targets in the body/);
+    }
+  });
+
+  it("applies the same check to the project pin", () => {
+    profiles.setToken("bulkpages", "tok_1234567890abcdefghij", { preferFile: true });
+    profiles.cachePages("bulkpages", SITE_A, [{ id: PAGE_A }]);
+    profiles.cachePages("bulkpages", SITE_B, [{ id: PAGE_B }]);
+    const pinned = { path: "/repo/.wf.json", config: { profile: "bulkpages", siteIds: [SITE_A] } };
+    assert.equal(project.checkSitePin(pinned, "beta/pages", bulk(PAGE_A)), null);
+    assert.match(project.checkSitePin(pinned, "beta/pages", bulk(PAGE_A, PAGE_B)), /OUTSIDE this project's pinned sites/);
+    assert.match(project.checkSitePin(pinned, "beta/pages", {}), /carries its targets in the request body/);
+  });
+});
+
 describe("audit log enrichment (2026-07-27)", () => {
   beforeEach(() => grants.revokeAll());
 

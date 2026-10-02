@@ -117,7 +117,7 @@ describe("the beta prefix does not hide a path's site from the gates", () => {
     const project = { path: "/repo/.wf.json", config: { profile: "acme", siteIds: [SITE_A] } };
     assert.equal(checkSitePin(project, `beta/sites/${SITE_A}/pages/schema-markup`), null);
     assert.match(checkSitePin(project, `beta/sites/${SITE_B}/pages/schema-markup`), /OUTSIDE this project's pinned sites/);
-    assert.match(checkSitePin(project, `beta/pages/${PAGE}/schema-markup`), /has no site id in the request path/);
+    assert.match(checkSitePin(project, `beta/pages/${PAGE}/schema-markup`), /not in the local site-scoping cache/);
   });
 
   it("refuses a beta write to another site under a site-scoped grant", async () => {

@@ -85,6 +85,11 @@
 //   wf fields add <collId> --type <Type> --name <Name> [--to <id>] [--options a,b,c]
 //   wf fields update <collId> <fieldId> [--name <Name>] [--help-text <text>] [--is-required true|false]
 //   wf fields update <collId> --file field-updates.json           one collection, one final server readback
+//   wf collections groups <collId> [--file groups.json] [--check] [--dry]
+//     (lists the CMS field groups, or replaces them from field slugs:
+//      {"SEO": ["meta-title"], "Hero": ["hero-image"]}. The endpoint replaces
+//      EVERY group, so the run prints before/after and names removed groups;
+//      --dry still reads the collection to resolve the slugs.)
 //   wf items set <collId> <itemId> --set slug=value […] [--draft true|false] [--archived true|false] [--live]
 //   wf item publish <collId> <itemId…>                            bulk publish (danger; --confirm the id set)
 //   wf page-schema <pageId…> --site <siteId> [--locale <id>]      JSON-LD schema markup (beta)
@@ -97,6 +102,16 @@
 //      the endpoint's own {"pages":[{id, jsonLdSchema}]} bulk body. --site
 //      routes through the site-scoped bulk endpoints, which are the ones a
 //      site-scoped grant can verify — always pass it.)
+//   wf fonts upload <file…> --site <siteId> [--dir <path>] [--family <name>] [--display swap] [--force] [--dry]
+//     (reads family, weight, italic and variable axes from each .woff2/.woff/
+//      .ttf/.otf file, refuses the whole set before any call if one cannot be
+//      read, skips file names already on the site, registers 25 per call and
+//      uploads each file.)
+//   wf pages meta <siteId> [--json]                              every page's title, slug, SEO and Open Graph
+//   wf pages meta set <siteId> --file meta.json [--check] [--dry]
+//     (edit the --json output and send it back: pages match by path or id,
+//      only changed fields are sent, 100 per bulk call (beta), each change is
+//      printed old → new, and a slug the API would silently ignore is refused.)
 //   wf publish <siteId> [--domains a.com,b.com | --subdomain] --confirm <siteId>
 //     (defaults to EVERY custom domain plus the webflow.io subdomain, and always
 //      prints what it published to. Publishing only the subdomain leaves the
@@ -175,12 +190,15 @@ import { parseTtl, readJsonDetail } from "../lib/config.mjs";
 import { diagnose, formatDiagnosis, formatReference } from "../lib/doctor.mjs";
 import { ENDPOINTS } from "../lib/endpoints.mjs";
 import { CODES } from "../lib/error-codes.mjs";
+import { describeFieldGroups, planFieldGroups, verifyFieldGroups } from "../lib/field-groups.mjs";
 import { buildFieldUpdateBatch, buildFieldUpdateBody, preflightFieldUpdateBatch, verifyFieldUpdate, verifyFieldUpdateBatch } from "../lib/fields.mjs";
+import { BATCH_MAX as FONT_BATCH_MAX, FONT_DISPLAY, FONT_EXT, planFonts, uploadFonts } from "../lib/fonts.mjs";
 import { MS_PER_DAY, describeGrant, getGrant, isFailure, issueGrant, listGrants, readAudit, revokeAll, revokeGrant } from "../lib/grants.mjs";
 import { fetchWithTimeout } from "../lib/http-json.mjs";
 import { PIXEL_CHECK_STATUS, describePixelCheck, findDecoder, isPixelCheckBlocking, samplePixels } from "../lib/image-pixels.mjs";
 import { LINK_FIELD_TYPES, applyTargetStatus, auditLinks, listAllItems, normalizeHosts, renderLinkAudit, resolveTargets } from "../lib/links.mjs";
 import { offloadIfLarge } from "../lib/offload.mjs";
+import { pageMetaRows, planPageMeta, verifyPageMeta } from "../lib/page-meta.mjs";
 import {
   cacheCollections,
   cachePages,
@@ -279,7 +297,9 @@ const {
   flagAllowUniform,
   flagSkipPixelCheck,
   flagMaxWidth,
-  flagDomains
+  flagDomains,
+  flagFamily,
+  flagDisplay
 } = parseCliArgs(process.argv.slice(2));
 
 if (liveClientAccess) {
@@ -777,13 +797,13 @@ const request = async ({ method, path, query: q2, body }) => {
   // webflowRequest (below) now enforces this same pin itself — see
   // lib/client.mjs — so this is no longer the only thing standing between a
   // wrong-client path and the network. It stays here anyway: checkSitePin is
-  // a pure function of (project, path), so this and the identical check
+  // a pure function of (project, path, body), so this and the identical check
   // inside webflowRequest can never disagree — either both refuse or both
   // pass. Keeping it means the CLI still fails fast, with this exact message,
   // before spending time on --check/--dry/validation for a call that was
   // always going to be refused; it can never produce a SECOND, different
   // refusal, because a refusal here exits before webflowRequest is reached.
-  const pinError = checkSitePin(project, path);
+  const pinError = checkSitePin(project, path, body);
   if (pinError) die(`[${CODES.WF_SITE_PIN}] ${pinError}`);
 
   const { endpoint, checked } = validateOrDie({ method, path, body });
@@ -1071,6 +1091,85 @@ if (cmd === "assets") {
   }
 }
 
+// `wf fonts upload <file…> --site <id>` — register and upload custom fonts.
+// Family, weight, italic and variable axes are read from each file, the whole
+// set is checked before any call, files already on the site (same file name)
+// are skipped, and registration goes 25 at a time through batchCreate.
+if (cmd === "fonts") {
+  if ((positionals[1] || "").toLowerCase() !== "upload")
+    die(
+      "Usage: wf fonts upload <file…> --site <id> [--dir <path>] [--family <name>] [--display swap] [--force] [--dry]",
+      "wf call custom_fonts list --p site_id=<id> lists what is there."
+    );
+  if (!flagSite) die("wf fonts upload requires --site <siteId> (the 24-hex Data API id — `wf site <name>` resolves it).");
+  const pinError = checkSitePin(project, `sites/${flagSite}/custom_fonts`);
+  if (pinError) die(`[${CODES.WF_SITE_PIN}] ${pinError}`);
+  const fontDisplay = flagDisplay || "swap";
+  if (!FONT_DISPLAY.includes(fontDisplay)) die(`--display must be one of ${FONT_DISPLAY.join(", ")}.`);
+
+  const files = flagDir
+    ? readdirSync(resolve(flagDir))
+        .map((name) => join(resolve(flagDir), name))
+        .filter((full) => statSync(full).isFile() && FONT_EXT.has(extname(full).toLowerCase()))
+    : positionals.slice(2).map((f) => resolve(f));
+  if (!files.length) die("No fonts to upload — pass font files or --dir <path>.");
+
+  const { items, problems } = planFonts(files, { family: flagFamily, fontDisplay });
+  if (problems.length) {
+    console.error(`✗ ${problems.length} file(s) cannot be registered — nothing was sent:`);
+    for (const one of problems) console.error(`  - ${one.file}: ${one.error}`);
+    process.exit(1);
+  }
+  const names = items.map((item) => item.body.fileName.toLowerCase());
+  const repeated = names.filter((name, index) => names.indexOf(name) !== index);
+  if (repeated.length) die(`Two files share a name (${[...new Set(repeated)].join(", ")}) — Webflow tells fonts apart by file name.`);
+
+  let todo = items;
+  if (!flagForce && !dryRun) {
+    const existing = new Set();
+    for (let offset = 0; ; offset += 100) {
+      const page = await request({ method: "GET", path: `sites/${flagSite}/custom_fonts`, query: { limit: 100, offset } });
+      if (!page.ok) out(page, { path: `sites/${flagSite}/custom_fonts`, method: "GET" });
+      const fonts = Array.isArray(page.data?.customFonts) ? page.data.customFonts : [];
+      for (const font of fonts) if (font.fileName) existing.add(font.fileName.toLowerCase());
+      if (fonts.length < 100) break;
+    }
+    todo = items.filter((item) => !existing.has(item.body.fileName.toLowerCase()));
+    for (const item of items.filter((one) => !todo.includes(one)))
+      console.log(`= ${item.body.fileName} is already on the site — skipped (--force uploads it again)`);
+    if (!todo.length) {
+      console.log("Nothing left to upload.");
+      process.exit(0);
+    }
+  }
+
+  for (const item of todo) {
+    const { fontFamily, weight, italic, axes } = item.body;
+    console.log(
+      `${item.body.fileName}  →  ${fontFamily} ${weight}${italic ? " italic" : ""}${axes ? `  axes ${axes.map((a) => `${a.tag} ${a.min}-${a.max}`).join(", ")}` : ""}`
+    );
+  }
+  const rows = await uploadFonts({ profile, siteId: flagSite, items: todo, dryRun, project });
+  if (dryRun) {
+    console.log(
+      JSON.stringify(
+        {
+          wouldSend: rows.map((row) => row.wouldSend || row.error),
+          note: `--dry: ${Math.ceil(todo.length / FONT_BATCH_MAX)} batchCreate request(s), then one upload per font; nothing was sent.`
+        },
+        null,
+        2
+      )
+    );
+    process.exit(0);
+  }
+  for (const row of rows) console.log(row.ok ? `✓ ${basename(row.file)}  ${row.fontId}` : `✗ ${basename(row.file)}  ${row.error}`);
+  const failed = rows.filter((row) => !row.ok);
+  if (failed[0]?.hint) console.error(`  → ${failed[0].hint}`);
+  console.log(`${rows.length - failed.length} uploaded, ${failed.length} failed.`);
+  process.exit(failed.length ? 1 : 0);
+}
+
 // `wf page-schema` — a page's JSON-LD schema markup, first-class.
 //
 // The four beta schema-markup endpoints (see `wf ls pages`) are reachable
@@ -1325,6 +1424,59 @@ ${sites.length} site(s) in "${profile}". NOTE: the Data API site id is the 24-he
 // collections/items/fields paths (see the comment there). Doesn't shadow the
 // existing `wf collections <siteId>` shortcut below — only fires when the
 // second positional is literally "refresh".
+// `wf collections groups <collectionId>` lists the CMS field groups;
+// `--file groups.json` replaces them. The endpoint replaces EVERY group and
+// takes field ids, so this takes slugs, checks the rules first, prints the
+// before and after, names any group the write removes, and reads it back.
+if (cmd === "collections" && positionals[1] === "groups") {
+  const collectionId = positionals[2];
+  if (!collectionId)
+    die(
+      "Usage: wf collections groups <collectionId> [--file groups.json | --data '<json>'] [--check] [--dry]",
+      'groups.json: { "SEO": ["meta-title", "meta-description"], "Hero": ["hero-image"] } — [] or {} removes every group.'
+    );
+  const path = `collections/${collectionId}`;
+  // Slugs resolve against the live collection, so --dry and --check still
+  // read it (a read grant); they hold back only the PATCH.
+  const current = await webflowRequest({ profile, method: "GET", path, project });
+  if (!current.ok) out(current, { path, method: "GET" });
+  const spec = bodyFromFlags();
+  if (spec === undefined) {
+    const lines = describeFieldGroups(current.data);
+    console.log(lines.length ? lines.join("\n") : "No field groups.");
+    process.exit(0);
+  }
+  const plan = planFieldGroups({ collection: current.data, spec });
+  if (!plan.ok) {
+    console.error("✗ The groups were not sent:");
+    for (const error of plan.errors) console.error(`  • ${error}`);
+    process.exit(1);
+  }
+  console.log(`Before:\n${plan.before.map((line) => `  ${line}`).join("\n") || "  (no groups)"}`);
+  console.log(`After:\n${plan.after.map((line) => `  ${line}`).join("\n") || "  (no groups)"}`);
+  if (plan.removed.length) console.log(`Removed: ${plan.removed.join(", ")}`);
+  if (flagCheck) {
+    validateOrDie({ method: "PATCH", path, body: plan.body });
+    console.log("✓ --check: nothing was sent.");
+    process.exit(0);
+  }
+  const written = await request({ method: "PATCH", path, body: plan.body });
+  if (!written.ok || written.dryRun) out(written, { path, method: "PATCH" });
+  const reread = await request({ method: "GET", path });
+  if (!reread.ok || !verifyFieldGroups({ collection: reread.data, body: plan.body }))
+    out(
+      {
+        ok: false,
+        errorCode: CODES.WF_WRITE_UNVERIFIED,
+        error: "The PATCH returned, but a fresh read does not show the groups that were sent.",
+        details: { sent: plan.body, read: reread.data?.fieldGroups ?? reread.error }
+      },
+      { path, method: "GET" }
+    );
+  console.log("✓ Field groups saved and read back.");
+  process.exit(0);
+}
+
 if (cmd === "collections" && positionals[1] === "refresh") {
   if (!flagSites) die("Usage: wf collections refresh --sites <name-or-id>[,…] [--profile p]");
   if (!profile) die("No profile resolved. Pass --profile <name>.");
@@ -1347,6 +1499,85 @@ if (cmd === "collections" && positionals[1] === "refresh") {
     }
   }
   process.exit(failed ? 1 : 0);
+}
+
+// `wf pages meta <siteId>` prints every page's title, slug, SEO and Open
+// Graph; `--json` prints the same as an editable file, and `wf pages meta set
+// <siteId> --file meta.json` writes it back through the bulk endpoint. Pages
+// are matched by path or id and only changed fields are sent.
+if (cmd === "pages" && positionals[1] === "meta") {
+  const setting = positionals[2] === "set";
+  const siteId = positionals[setting ? 3 : 2];
+  if (!siteId) die("Usage: wf pages meta <siteId> [--json] | wf pages meta set <siteId> --file meta.json [--check] [--dry]");
+  const listPath = `sites/${siteId}/pages`;
+  // --dry and --check still read the pages (a read grant): the plan is a diff
+  // against them. Only the PATCH is held back.
+  const pages = [];
+  for (let offset = 0; ; offset += 100) {
+    const res = await webflowRequest({ profile, method: "GET", path: listPath, query: { limit: 100, offset }, project });
+    if (!res.ok) out(res, { path: listPath, method: "GET" });
+    const batch = Array.isArray(res.data?.pages) ? res.data.pages : [];
+    pages.push(...batch);
+    if (batch.length < 100) break;
+  }
+  // The listing is site-scoped, so it is proof of which site each page is on.
+  cachePages(profile, siteId, pages);
+  const rows = pageMetaRows(pages.filter((page) => !page.draft && !page.archived));
+  if (!setting) {
+    if (flagJson) out({ ok: true, data: rows }, { path: listPath, method: "GET" });
+    for (const row of rows)
+      console.log(
+        `${row.path.padEnd(32)} ${String(row.title ?? "").padEnd(28)} ${row.seo.title ? "seo ✓" : "seo ✗"}  ${row.seo.description ? "desc ✓" : "desc ✗"}  ${row.openGraph.title || row.openGraph.titleCopied ? "og ✓" : "og ✗"}`
+      );
+    console.log(`\n${rows.length} page(s). --json prints an editable file for \`wf pages meta set\`.`);
+    process.exit(0);
+  }
+  const entries = bodyFromFlags();
+  if (entries === undefined) die("wf pages meta set needs --file meta.json or --data '<json>'.", `wf pages meta ${siteId} --json > meta.json   then edit it`);
+  const plan = planPageMeta({ pages, entries });
+  if (!plan.ok) {
+    console.error("✗ Nothing was sent:");
+    for (const error of plan.errors) console.error(`  • ${error}`);
+    process.exit(1);
+  }
+  for (const line of plan.changes) console.log(line);
+  const sending = plan.batches.flat().length;
+  console.log(`${sending} page(s) to change, ${plan.unchanged} already match.`);
+  if (!sending) process.exit(0);
+  if (flagCheck) {
+    for (const batch of plan.batches) validateOrDie({ method: "PATCH", path: "beta/pages", body: { pages: batch } });
+    console.log("✓ --check: nothing was sent.");
+    process.exit(0);
+  }
+  const misses = [];
+  for (const [index, batch] of plan.batches.entries()) {
+    const written = await request({ method: "PATCH", path: "beta/pages", body: { pages: batch } });
+    if (written.dryRun) {
+      console.log(JSON.stringify(written.data, null, 2));
+      continue;
+    }
+    if (!written.ok) {
+      const applied = plan.batches.slice(0, index).flat().length;
+      out(
+        { ...written, error: `Batch ${index + 1} of ${plan.batches.length} failed after ${applied} page(s) were changed: ${written.error}` },
+        { path: "beta/pages", method: "PATCH" }
+      );
+    }
+    misses.push(...verifyPageMeta({ sent: batch, returned: written.data?.pages }));
+  }
+  if (dryRun) process.exit(0);
+  if (misses.length)
+    out(
+      {
+        ok: false,
+        errorCode: CODES.WF_WRITE_UNVERIFIED,
+        error: "The bulk update returned, but the response does not show every value that was sent.",
+        details: misses
+      },
+      { path: "beta/pages", method: "PATCH" }
+    );
+  console.log(`✓ ${sending} page(s) updated; the response shows every value sent. Publish the site for the change to go live.`);
+  process.exit(0);
 }
 
 // `wf pages refresh --sites <name-or-id>[,…]` — free (no grant), refills the
